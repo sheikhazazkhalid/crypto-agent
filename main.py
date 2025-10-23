@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import sqlite3
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 import urllib.parse
 import urllib.request
 import json
@@ -15,8 +15,7 @@ CONFIG = {
     # ==== Exchange / General ====
     'api_key': '',                    # Binance/Bybit API key (optional for dry-run)
     'api_secret': '',                 # Binance/Bybit API secret (optional for dry-run)
-    'symbols': ['BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'XRP/USDT', 'SOL/USDT', 'ADA/USDT', 'LINK/USDT', 'XLM/USDT', 'BCH/USDT', 'HBAR/USDT', 'AVAX/USDT', 'POL/USDT', 'LTC/USDT', 'DOT/USDT']
-,  # Trading pairs to monitor
+    'symbols': ['BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'XRP/USDT', 'SOL/USDT', 'ADA/USDT', 'LINK/USDT', 'AVAX/USDT', 'POL/USDT', 'LTC/USDT', 'DOT/USDT'],
     'timeframe': '5m',                # Candle interval: 5m gives smoother signals than 1m
     'limit': 300,                     # Number of candles to fetch (for indicators)
     'poll_interval': 30,              # Seconds between each data fetch / cycle
@@ -27,25 +26,39 @@ CONFIG = {
     'telegram_chat_id': '',           # e.g. '-1001234567890' or '123456789'
 
     # ==== Discord (fill this) ====
-    'discord_webhook': 'https://discord.com/api/webhooks/1430967851421798611/Lz1C4uPNljUJIWpOL5LDjI3FjnraGhBCrCa4omTSWJ8U-LYYN_0Ve8TEXSVdy30EJmI0',            # e.g. 'https://discord.com/api/webhooks/....'
+    'discord_webhook': 'https://discord.com/api/webhooks/1430967851421798611/Lz1C4uPNljUJIWpOL5LDjI3FjnraGhBCrCa4omTSWJ8U-LYYN_0Ve8TEXSVdy30EJmI0',
     'discord_username': 'Azaz#8117',  # Optional custom username for webhook messages
+
+    # ==== Feature toggles (enable/disable indicators & S/R) ====
+    'enable_ema': True,
+    'enable_macd': True,
+    'enable_rsi': True,
+    'enable_volume_avg': True,
+    'enable_sr': False,                # master toggle for support/resistance calculation
+    'enable_support': True,           # allow checking support condition for entries
+    'enable_resistance': True,        # allow checking resistance condition for entries
+
+    # ==== Cross options: use cross events instead of single-bar sign checks ====
+    'use_ema_cross': True,            # True => require EMA Fast crossing above EMA Slow (bullish cross)
+    'use_macd_cross': True,           # True => require MACD crossing above Signal (bullish cross)
+
     # ==== Risk Management ====
-    'trade_allocation': 0.05,         # % of available USDT balance per trade (e.g., 5%)
+    'trade_allocation': 0.10,         # % of available USDT balance per trade (e.g., 5%)
     'min_trade_usdt': 10.0,           # Minimum USDT per trade (to skip dust orders)
-    'stop_loss_pct': 0.025,           # 2.5% stop loss from entry price
-    'take_profit_pct': 0.04,          # 4% take profit target → 1:1.6 R:R ratio approx.
+    'stop_loss_pct': 0.01,           # 1% stop loss from entry price
+    'take_profit_pct': 0.02,          # 2% take profit target → 1:1 R:R ratio approx.
 
     # ==== Indicator Config ====
     'ema_fast_span': 12,              # Short-term EMA for trend detection
     'ema_slow_span': 26,              # Long-term EMA for trend confirmation
     'macd_signal_span': 9,            # MACD signal line smoothing period
     'rsi_period': 14,                 # RSI lookback window
-    'rsi_buy_threshold': 40,          # Buy if RSI < 40 (mildly oversold)
+    'rsi_buy_threshold': 30,          # Buy if RSI < 30
     'rsi_sell_threshold': 60,         # Exit if RSI > 60 (momentum slowing)
 
     # ==== Support / Resistance ====
     'sr_mode': 'pivot',               # Options: 'pivot', 'rolling', 'fractal'
-    'support_window': 20,             # Lookback window for rolling or fractal SR calc
+    'support_window': 50,             # Lookback window for rolling or fractal SR calc
     'support_buffer_pct': 0.003,      # +0.3% above support → safe entry zone
     'resistance_buffer_pct': 0.003,   # -0.3% below resistance → avoid buying too high
 
@@ -54,6 +67,9 @@ CONFIG = {
     'breakout_close_bars': 2,         # Require 2 consecutive closes above resistance
     'breakout_volume_multiplier': 1.5,# Volume must exceed avg_volume * multiplier
     'volume_avg_window': 20,          # Lookback for average volume calculation
+
+    # new: minimum number of enabled checks required to enter (use 2 or 3 to be more permissive)
+    'min_checks_to_buy': 3,
 }
 
 
@@ -61,12 +77,12 @@ CONFIG = {
 class MultiPairBot:
     def __init__(self, cfg):
         self.cfg = cfg
-        self.client = ccxt.binance({
+        self.client = ccxt.binanceus({
             'apiKey': cfg['api_key'],
             'secret': cfg['api_secret'],
             'options': {'defaultType': 'spot'}
         })
-        self.client.set_sandbox_mode(True)
+        #self.client.set_sandbox_mode(True)
         self.conn = sqlite3.connect('trades.db', check_same_thread=False)
         self.create_tables()
         self.positions = {symbol: None for symbol in cfg['symbols']}
@@ -134,19 +150,47 @@ class MultiPairBot:
         self.send_discord_alert(text)
 
     def create_tables(self):
+        """
+        Create trades table or add missing columns if table exists (simple migration).
+        """
+        desired_columns = {
+            'symbol': 'TEXT',
+            'side': 'TEXT',
+            'price': 'REAL',
+            'amount': 'REAL',
+            'stop_loss': 'REAL',
+            'take_profit': 'REAL',
+            'closed': 'INTEGER DEFAULT 0',
+            'profit_loss': 'REAL',
+            'timestamp': "DATETIME DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now'))"
+        }
         with self.conn:
-            self.conn.execute('''CREATE TABLE IF NOT EXISTS trades (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                symbol TEXT,
-                side TEXT,
-                price REAL,
-                amount REAL,
-                stop_loss REAL,
-                take_profit REAL,
-                closed INTEGER DEFAULT 0,
-                profit_loss REAL,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            )''')
+            cur = self.conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='trades'")
+            if not cur.fetchone():
+                # create fresh table with full schema
+                self.conn.execute('''CREATE TABLE IF NOT EXISTS trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT,
+                    side TEXT,
+                    price REAL,
+                    amount REAL,
+                    stop_loss REAL,
+                    take_profit REAL,
+                    closed INTEGER DEFAULT 0,
+                    profit_loss REAL,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )''')
+                return
+
+            # table exists -> inspect existing columns and add missing ones
+            existing = [row[1] for row in self.conn.execute("PRAGMA table_info('trades')").fetchall()]
+            for col, coltype in desired_columns.items():
+                if col not in existing:
+                    try:
+                        self.conn.execute(f'ALTER TABLE trades ADD COLUMN {col} {coltype}')
+                    except Exception as e:
+                        # log but continue; ALTER failures should not stop bot
+                        print(f"[DB migration] failed to add column {col}: {e}")
 
     def fetch_data(self, symbol):
         ohlcv = self.client.fetch_ohlcv(symbol, self.cfg['timeframe'], limit=self.cfg['limit'])
@@ -157,72 +201,78 @@ class MultiPairBot:
 
     def compute_rsi(self, prices, period):
         delta = prices.diff()
-        gain = delta.where(delta > 0, 0.0)
-        loss = -delta.where(delta < 0, 0.0)
-        avg_gain = gain.rolling(window=period, min_periods=period).mean()
-        avg_loss = loss.rolling(window=period, min_periods=period).mean()
-        avg_gain = avg_gain.ffill()
-        avg_loss = avg_loss.ffill()
-        rs = avg_gain / (avg_loss.replace(0, np.nan))
+        up = delta.where(delta > 0, 0.0)
+        down = -delta.where(delta < 0, 0.0)
+
+        # Wilder smoothing: alpha = 1/period, adjust=False
+        avg_up = up.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+        avg_down = down.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+
+        rs = avg_up / avg_down.replace(0, np.nan)
         rsi = 100 - (100 / (1 + rs))
-        rsi = rsi.fillna(50)
-        return rsi
+        return rsi.fillna(50)
 
     def calculate_indicators(self, df):
         c = self.cfg
         df = df.copy()
-        df['EMA_fast'] = df['close'].ewm(span=c['ema_fast_span'], adjust=False).mean()
-        df['EMA_slow'] = df['close'].ewm(span=c['ema_slow_span'], adjust=False).mean()
-        df['MACD'] = df['EMA_fast'] - df['EMA_slow']
-        df['Signal'] = df['MACD'].ewm(span=c['macd_signal_span'], adjust=False).mean()
-        df['RSI'] = self.compute_rsi(df['close'], c['rsi_period'])
-        df['vol_avg'] = df['volume'].rolling(window=c['volume_avg_window']).mean()
 
-        mode = c.get('sr_mode', 'rolling').lower()
+        # safe helpers
+        def safe_ewm(series, span):
+            return series.ewm(span=span, adjust=False).mean()
 
-        if mode == 'pivot':
-            # Classic pivot points (per bar) - then we will use most recent pivot levels
-            df['Pivot'] = (df['high'] + df['low'] + df['close']) / 3
-            df['Support'] = (2 * df['Pivot']) - df['high']
-            df['Resistance'] = (2 * df['Pivot']) - df['low']
+        # EMA
+        if c.get('enable_ema', True):
+            df['EMA_fast'] = safe_ewm(df['close'], c['ema_fast_span'])
+            df['EMA_slow'] = safe_ewm(df['close'], c['ema_slow_span'])
+        else:
+            df['EMA_fast'] = np.nan
+            df['EMA_slow'] = np.nan
 
-            # For stability, take rolling mean of last few pivot-derived levels
-            df['Support'] = df['Support'].rolling(window=3, min_periods=1).mean()
-            df['Resistance'] = df['Resistance'].rolling(window=3, min_periods=1).mean()
+        # MACD (depends on EMAs)
+        if c.get('enable_macd', True) and c.get('enable_ema', True):
+            df['MACD'] = df['EMA_fast'] - df['EMA_slow']
+            df['Signal'] = df['MACD'].ewm(span=c['macd_signal_span'], adjust=False).mean()
+        else:
+            df['MACD'] = np.nan
+            df['Signal'] = np.nan
 
-        elif mode == 'fractal':
-            # Fractal detection using center window (5 candles)
-            def support_fractal(arr):
-                # arr: [low(-2), low(-1), low(0), low(+1), low(+2)]
-                mid = arr[2]
-                if mid == np.nanmin(arr):
-                    return mid
-                return np.nan
+        # RSI
+        if c.get('enable_rsi', True):
+            df['RSI'] = self.compute_rsi(df['close'], c['rsi_period'])
+        else:
+            df['RSI'] = np.nan
 
-            def resistance_fractal(arr):
-                mid = arr[2]
-                if mid == np.nanmax(arr):
-                    return mid
-                return np.nan
+        # Volume average
+        if c.get('enable_volume_avg', True):
+            df['vol_avg'] = df['volume'].rolling(window=c['volume_avg_window']).mean()
+        else:
+            df['vol_avg'] = np.nan
 
-            df['Support'] = df['low'].rolling(window=5, center=True).apply(
-                lambda x: x[2] if x[2] == x.min() else np.nan, raw=True)
-            df['Resistance'] = df['high'].rolling(window=5, center=True).apply(
-                lambda x: x[2] if x[2] == x.max() else np.nan, raw=True)
+        # Support / Resistance calculation (master toggle)
+        if c.get('enable_sr', True):
+            mode = c.get('sr_mode', 'rolling').lower()
+            if mode == 'pivot':
+                df['Pivot'] = (df['high'] + df['low'] + df['close']) / 3
+                df['Support'] = (2 * df['Pivot']) - df['high']
+                df['Resistance'] = (2 * df['Pivot']) - df['low']
+                df['Support'] = df['Support'].rolling(window=3, min_periods=1).mean()
+                df['Resistance'] = df['Resistance'].rolling(window=3, min_periods=1).mean()
+            elif mode == 'fractal':
+                df['Support'] = df['low'].rolling(window=5, center=True).apply(
+                    lambda x: x[2] if x[2] == x.min() else np.nan, raw=True)
+                df['Resistance'] = df['high'].rolling(window=5, center=True).apply(
+                    lambda x: x[2] if x[2] == x.max() else np.nan, raw=True)
+                df['Support'] = df['Support'].ffill().bfill()
+                df['Resistance'] = df['Resistance'].ffill().bfill()
+            else:
+                df['Support'] = df['low'].rolling(window=c['support_window'], min_periods=1).min()
+                df['Resistance'] = df['high'].rolling(window=c['support_window'], min_periods=1).max()
 
-            # Forward/backfill to give usable levels until new fractal appears
             df['Support'] = df['Support'].ffill().bfill()
             df['Resistance'] = df['Resistance'].ffill().bfill()
-
         else:
-            # rolling min/max (simple)
-            df['Support'] = df['low'].rolling(window=c['support_window'], min_periods=1).min()
-            df['Resistance'] = df['high'].rolling(window=c['support_window'], min_periods=1).max()
-
-        # Avoid NaNs for the last row by filling from previous values if necessary
-        df['Support'] = df['Support'].ffill().bfill()
-        df['Resistance'] = df['Resistance'].ffill().bfill()
-
+            df['Support'] = np.nan
+            df['Resistance'] = np.nan
 
         return df
 
@@ -236,7 +286,7 @@ class MultiPairBot:
         return {'USDT': usdt}
 
     def place_order(self, symbol, side, amount, price):
-        timestamp = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
         if self.cfg['dry_run']:
             msg = f"[DRY RUN] {timestamp} | {symbol} | {side.upper()} {amount:.8f} @ {price:.8f}"
             print(msg)
@@ -331,11 +381,18 @@ class MultiPairBot:
         trade_amount = trade_amount_usdt / current_price
         pos = self.positions.get(symbol)
 
+        # helper for pretty printing values that might be NaN
+        def fmt(x, prec=4):
+            try:
+                return f"{float(x):.{prec}f}"
+            except Exception:
+                return "n/a"
+
         # --- Live Indicator Snapshot ---
         print(f"\n[{symbol}] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"Price: {current_price:.4f} | EMA Fast: {latest['EMA_fast']:.4f} | EMA Slow: {latest['EMA_slow']:.4f}")
-        print(f"MACD: {latest['MACD']:.6f} | Signal: {latest['Signal']:.6f} | RSI: {latest['RSI']:.2f}")
-        print(f"Support: {latest['Support']:.4f} | Resistance: {latest['Resistance']:.4f} | Vol Avg: {latest['vol_avg']:.4f}")
+        print(f"Price: {current_price:.4f} | EMA Fast: {fmt(latest.get('EMA_fast'))} | EMA Slow: {fmt(latest.get('EMA_slow'))}")
+        print(f"MACD: {fmt(latest.get('MACD'),6)} | Signal: {fmt(latest.get('Signal'),6)} | RSI: {fmt(latest.get('RSI'),2)}")
+        print(f"Support: {fmt(latest.get('Support'))} | Resistance: {fmt(latest.get('Resistance'))} | Vol Avg: {fmt(latest.get('vol_avg'))}")
 
         if pos:
             print(f"→ Open {pos['side'].upper()} @ {pos['price']:.4f} | SL: {pos['stop_loss']:.4f} | TP: {pos['take_profit']:.4f}")
@@ -356,19 +413,41 @@ class MultiPairBot:
 
         # --- Entry Logic ---
         if not pos:
-            # Basic reversal entry inside support/resistance channel
-            buy_condition_base = (
-                (latest['EMA_fast'] > latest['EMA_slow']) and
-                (latest['MACD'] > latest['Signal']) and
-                (latest['RSI'] < c['rsi_buy_threshold']) and
-                (current_price > latest['Support'] * (1 + c['support_buffer_pct'])) and
-                (current_price < latest['Resistance'] * (1 - c['resistance_buffer_pct']))
-            )
+            # Build list of enabled checks (booleans)
+            checks = []
 
-            # Breakout entry: price closes above resistance + confirmation
+            # EMA: either cross event or simple sign check based on config
+            if c.get('enable_ema', True):
+                if c.get('use_ema_cross', True):
+                    checks.append(self.is_bullish_ema_cross(df))
+                else:
+                    checks.append(latest['EMA_fast'] > latest['EMA_slow'])
+
+            # MACD: either cross event or simple sign check based on config
+            if c.get('enable_macd', True):
+                if c.get('use_macd_cross', True):
+                    checks.append(self.is_bullish_macd_cross(df))
+                else:
+                    checks.append(latest['MACD'] > latest['Signal'])
+
+            if c.get('enable_rsi', True):
+                checks.append(latest['RSI'] < c['rsi_buy_threshold'])
+
+            if c.get('enable_support', True) and not np.isnan(latest.get('Support', np.nan)):
+                checks.append(current_price > latest['Support'] * (1 + c['support_buffer_pct']))
+
+            if c.get('enable_resistance', True) and not np.isnan(latest.get('Resistance', np.nan)):
+                checks.append(current_price < latest['Resistance'] * (1 - c['resistance_buffer_pct']))
+
+            # require at least min_checks_to_buy of the enabled checks to be true
+            enabled_checks_count = len(checks)
+            true_checks = sum(1 for v in checks if bool(v))
+            min_req = int(c.get('min_checks_to_buy', 2))
+            buy_condition_base = (enabled_checks_count > 0) and (true_checks >= min_req)
+
+            # Breakout entry: price closes above resistance + confirmation (only if breakout enabled)
             breakout_condition = False
-            if c.get('enable_breakout', False):
-                # price must be above resistance buffer and breakout_confirmed
+            if c.get('enable_breakout', False) and not np.isnan(latest.get('Resistance', np.nan)):
                 if current_price > latest['Resistance'] * (1 + c['resistance_buffer_pct']):
                     breakout_condition = self.breakout_confirmed(df)
 
@@ -391,6 +470,12 @@ class MultiPairBot:
 
                 reason = "BREAKOUT" if breakout_condition else "CHANNEL_ENTRY"
                 print(f"✅ {symbol}: BUY @ {current_price:.4f} | SL {stop_loss:.4f} | TP {take_profit:.4f} | REASON: {reason}")
+
+                # send detailed alert (includes SL/TP) after position is recorded
+                timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+                alert_msg = (f"🟢 {timestamp} | {symbol} | BUY {trade_amount:.8f} @ {current_price:.8f} "
+                             f"| SL {stop_loss:.8f} | TP {take_profit:.8f} | REASON: {reason}")
+                self.send_alerts(alert_msg)
 
     def summarize_performance(self):
         df = pd.read_sql('SELECT * FROM trades', self.conn)
@@ -450,6 +535,38 @@ class MultiPairBot:
                 time.sleep(0.5)
             except Exception:
                 pass
+
+    # --- new helper methods for detecting cross events ---
+    def is_bullish_ema_cross(self, df):
+        """Return True if EMA_fast crossed above EMA_slow between previous and last bar."""
+        if len(df) < 2:
+            return False
+        prev = df.iloc[-2]
+        cur = df.iloc[-1]
+        try:
+            ef_prev = float(prev['EMA_fast'])
+            es_prev = float(prev['EMA_slow'])
+            ef_cur = float(cur['EMA_fast'])
+            es_cur = float(cur['EMA_slow'])
+        except Exception:
+            return False
+        return (ef_prev <= es_prev) and (ef_cur > es_cur)
+
+    def is_bullish_macd_cross(self, df):
+        """Return True if MACD crossed above Signal between previous and last bar."""
+        if len(df) < 2:
+            return False
+        prev = df.iloc[-2]
+        cur = df.iloc[-1]
+        try:
+            m_prev = float(prev['MACD'])
+            s_prev = float(prev['Signal'])
+            m_cur = float(cur['MACD'])
+            s_cur = float(cur['Signal'])
+        except Exception:
+            return False
+        return (m_prev <= s_prev) and (m_cur > s_cur)
+    # --- end new helpers ---
 
 if __name__ == '__main__':
     bot = MultiPairBot(CONFIG)
