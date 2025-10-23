@@ -4,17 +4,31 @@ import numpy as np
 import sqlite3
 import time
 from datetime import datetime
+import urllib.parse
+import urllib.request
+import json
+import traceback
+import atexit
+import sys
 
 CONFIG = {
     # ==== Exchange / General ====
     'api_key': '',                    # Binance/Bybit API key (optional for dry-run)
     'api_secret': '',                 # Binance/Bybit API secret (optional for dry-run)
-    'symbols': ['BTC/USDT', 'ETH/USDT'],  # Trading pairs to monitor
+    'symbols': ['BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'XRP/USDT', 'SOL/USDT', 'ADA/USDT', 'LINK/USDT', 'XLM/USDT', 'BCH/USDT', 'HBAR/USDT', 'AVAX/USDT', 'POL/USDT', 'LTC/USDT', 'DOT/USDT']
+,  # Trading pairs to monitor
     'timeframe': '5m',                # Candle interval: 5m gives smoother signals than 1m
     'limit': 300,                     # Number of candles to fetch (for indicators)
     'poll_interval': 30,              # Seconds between each data fetch / cycle
     'dry_run': True,                  # True = no real trades, for safe testing
 
+    # ==== Telegram (fill these) ====
+    'telegram_token': '',             # e.g. '123456:ABC-DEF...'
+    'telegram_chat_id': '',           # e.g. '-1001234567890' or '123456789'
+
+    # ==== Discord (fill this) ====
+    'discord_webhook': 'https://discord.com/api/webhooks/1430967851421798611/Lz1C4uPNljUJIWpOL5LDjI3FjnraGhBCrCa4omTSWJ8U-LYYN_0Ve8TEXSVdy30EJmI0',            # e.g. 'https://discord.com/api/webhooks/....'
+    'discord_username': 'Azaz#8117',  # Optional custom username for webhook messages
     # ==== Risk Management ====
     'trade_allocation': 0.05,         # % of available USDT balance per trade (e.g., 5%)
     'min_trade_usdt': 10.0,           # Minimum USDT per trade (to skip dust orders)
@@ -56,6 +70,68 @@ class MultiPairBot:
         self.conn = sqlite3.connect('trades.db', check_same_thread=False)
         self.create_tables()
         self.positions = {symbol: None for symbol in cfg['symbols']}
+        # register exit handler to notify on normal exit
+        try:
+            atexit.register(self.on_exit)
+        except Exception:
+            pass
+
+    # Telegram helper
+    def send_telegram_alert(self, text: str):
+        token = self.cfg.get('telegram_token') or ''
+        chat_id = self.cfg.get('telegram_chat_id') or ''
+        if not token or not chat_id:
+            return  # no creds provided
+        try:
+            base = f"https://api.telegram.org/bot{token}/sendMessage"
+            data = urllib.parse.urlencode({
+                'chat_id': chat_id,
+                'text': text,
+                'parse_mode': 'HTML'
+            }).encode()
+            req = urllib.request.Request(base, data=data)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                resp.read()
+        except Exception as e:
+            print(f"[Telegram error] {e}")
+
+    # Discord helper
+    def send_discord_alert(self, text: str):
+        webhook = self.cfg.get('discord_webhook') or ''
+        if not webhook:
+            return
+        try:
+            # include optional username/avatar from config
+            payload_dict = {"content": text}
+            username = self.cfg.get('discord_username')
+            avatar = self.cfg.get('discord_avatar_url')
+            if username:
+                payload_dict['username'] = username
+            if avatar:
+                payload_dict['avatar_url'] = avatar
+
+            payload = json.dumps(payload_dict).encode()
+            headers = {
+                'Content-Type': 'application/json',
+                'User-Agent': 'crypto-agent/1.0'
+            }
+            req = urllib.request.Request(webhook, data=payload, headers=headers)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                resp.read()
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read().decode(errors='ignore')
+            except Exception:
+                body = '<no body>'
+            print(f"[Discord HTTPError] code={e.code} reason={e.reason} body={body}")
+        except Exception as e:
+            print(f"[Discord error] {e}")
+
+    # Convenience to send both (if configured)
+    def send_alerts(self, text: str):
+        # run both; failures are printed inside helpers
+        self.send_telegram_alert(text)
+        self.send_discord_alert(text)
 
     def create_tables(self):
         with self.conn:
@@ -83,19 +159,13 @@ class MultiPairBot:
         delta = prices.diff()
         gain = delta.where(delta > 0, 0.0)
         loss = -delta.where(delta < 0, 0.0)
-
-        # Use simple moving average for first 'period' then Wilder smoothing (optional)
         avg_gain = gain.rolling(window=period, min_periods=period).mean()
         avg_loss = loss.rolling(window=period, min_periods=period).mean()
-
-        # After initial values, apply Wilder smoothing
         avg_gain = avg_gain.ffill()
         avg_loss = avg_loss.ffill()
-
-
         rs = avg_gain / (avg_loss.replace(0, np.nan))
         rsi = 100 - (100 / (1 + rs))
-        rsi = rsi.fillna(50)  # neutral for the first rows
+        rsi = rsi.fillna(50)
         return rsi
 
     def calculate_indicators(self, df):
@@ -166,8 +236,12 @@ class MultiPairBot:
         return {'USDT': usdt}
 
     def place_order(self, symbol, side, amount, price):
+        timestamp = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
         if self.cfg['dry_run']:
-            print(f"[DRY RUN] {symbol}: {side.upper()} {amount:.8f} @ {price:.8f}")
+            msg = f"[DRY RUN] {timestamp} | {symbol} | {side.upper()} {amount:.8f} @ {price:.8f}"
+            print(msg)
+            # send telegram + discord alert for simulation too
+            self.send_alerts(f"🟡 {msg}")
             return {'symbol': symbol, 'side': side, 'price': price, 'amount': amount}
         else:
             # market order (price not used by API, kept for logging)
@@ -175,6 +249,12 @@ class MultiPairBot:
                 order = self.client.create_market_buy_order(symbol, amount)
             else:
                 order = self.client.create_market_sell_order(symbol, amount)
+            # try to extract price/amount for message (fallback to provided)
+            executed_price = float(order.get('price', price)) if isinstance(order, dict) else price
+            executed_amount = float(order.get('amount', amount)) if isinstance(order, dict) else amount
+            msg = f"[EXECUTED] {timestamp} | {symbol} | {side.upper()} {executed_amount:.8f} @ {executed_price:.8f}"
+            print(msg)
+            self.send_alerts(f"✅ {msg}")
             return order
 
     def log_trade(self, symbol, order, sl, tp):
@@ -188,7 +268,6 @@ class MultiPairBot:
 
     def close_trade_db(self, trade_id, pnl):
         with self.conn:
-            # update by id for correctness
             self.conn.execute('UPDATE trades SET closed=1, profit_loss=? WHERE id=?', (float(pnl), int(trade_id)))
 
     def close_position(self, symbol, close_price):
@@ -209,7 +288,10 @@ class MultiPairBot:
         if trade_id:
             self.close_trade_db(trade_id, pnl)
 
-        print(f"💰 {symbol}: Trade closed | P/L {pnl:.4f} USDT")
+        msg = f"💰 {symbol}: Trade closed | P/L {pnl:.4f} USDT"
+        print(msg)
+        # telegram + discord alert on close
+        self.send_alerts(f"🔴 {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} | {msg}")
         self.positions[symbol] = None
 
     def breakout_confirmed(self, df):
@@ -316,19 +398,58 @@ class MultiPairBot:
         print(f"\n📊 Total simulated profit: {total_profit:.4f} USDT | Trades: {len(df)}")
         return total_profit
 
+    def on_exit(self):
+        """Attempt to notify Discord/Telegram that the bot is stopping."""
+        try:
+            msg = f"🛑 Bot stopped: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}"
+            self.send_alerts(msg)
+            # small delay to allow network I/O to complete when possible
+            time.sleep(0.5)
+        except Exception:
+            # suppress any errors in exit handler
+            pass
+
     def run(self):
         print(f"🚀 Running Binance Spot Multi-Pair Bot ({', '.join(self.cfg['symbols'])})\n")
-        while True:
+        try:
+            while True:
+                try:
+                    for symbol in self.cfg['symbols']:
+                        df = self.fetch_data(symbol)
+                        df = self.calculate_indicators(df)
+                        self.trade_logic(symbol, df)
+                    self.summarize_performance()
+                    time.sleep(self.cfg['poll_interval'])
+                except KeyboardInterrupt:
+                    # user requested stop
+                    print("Interrupted by user (KeyboardInterrupt). Exiting loop.")
+                    self.send_alerts("⛔ Bot interrupted by user (KeyboardInterrupt). Exiting.")
+                    break
+                except Exception as e:
+                    tb = traceback.format_exc()
+                    print(f"❌ Error: {e}\n{tb}")
+                    # Limit traceback size to avoid too-large messages
+                    tb_short = tb if len(tb) <= 1500 else tb[:1500] + "\n...[truncated]"
+                    self.send_alerts(f"❌ Error in bot: {e}\nTraceback:\n{tb_short}")
+                    time.sleep(5)
+        except Exception as e:
+            # catch any outer/fatal exception
+            tb = traceback.format_exc()
+            print(f"💥 Fatal error: {e}\n{tb}")
+            tb_short = tb if len(tb) <= 1500 else tb[:1500] + "\n...[truncated]"
             try:
-                for symbol in self.cfg['symbols']:
-                    df = self.fetch_data(symbol)
-                    df = self.calculate_indicators(df)
-                    self.trade_logic(symbol, df)
-                self.summarize_performance()
-                time.sleep(self.cfg['poll_interval'])
-            except Exception as e:
-                print(f"❌ Error: {e}")
-                time.sleep(5)
+                self.send_alerts(f"💥 Fatal error: {e}\nTraceback:\n{tb_short}")
+            except Exception:
+                pass
+            # re-raise so process exit code reflects failure if desired
+            raise
+        finally:
+            # ensure a final shutdown alert (also handled by atexit)
+            try:
+                self.send_alerts(f"🟥 Bot exiting: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}")
+                time.sleep(0.5)
+            except Exception:
+                pass
 
 if __name__ == '__main__':
     bot = MultiPairBot(CONFIG)
