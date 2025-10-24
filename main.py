@@ -60,6 +60,8 @@ CONFIG = {
     # order type
     'order_type': 'market',  # 'market' or 'limit'
     'limit_price_buffer_pct': 0.001,  # 0.1% buffer for limit orders (above for buy, below for sell)
+    'exchange_for_data': 'binance',  # 'binanceus' for data (works on US cloud), 'binance' for global
+    'exchange_for_trading': 'binance', # 'binance' for global trading (your account), 'binanceus' for US
 }
 
 
@@ -67,12 +69,18 @@ CONFIG = {
 class MultiPairBot:
     def __init__(self, cfg):
         self.cfg = cfg
-        self.client = ccxt.binanceus({
+        # Use separate clients for data and trading
+        self.data_client = ccxt.__dict__[cfg['exchange_for_data']]({
+            'apiKey': '',  # no keys needed for data
+            'secret': '',
+            'options': {'defaultType': 'spot'}
+        })
+        self.client = ccxt.__dict__[cfg['exchange_for_trading']]({
             'apiKey': cfg['api_key'],
             'secret': cfg['api_secret'],
             'options': {'defaultType': 'spot'}
         })
-        #self.client.set_sandbox_mode(True)
+        #self.client.set_sandbox_mode(True)  # optional for testing
         self.conn = sqlite3.connect('trades.db', check_same_thread=False)
         self.create_tables()
         self.positions = {symbol: None for symbol in cfg['symbols']}
@@ -185,7 +193,8 @@ class MultiPairBot:
                         print(f"[DB migration] failed to add column {col}: {e}")
 
     def fetch_data(self, symbol):
-        ohlcv = self.client.fetch_ohlcv(symbol, self.cfg['timeframe'], limit=self.cfg['limit'])
+        # Use data_client for OHLCV
+        ohlcv = self.data_client.fetch_ohlcv(symbol, self.cfg['timeframe'], limit=self.cfg['limit'])
         df = pd.DataFrame(ohlcv, columns=['time','open','high','low','close','volume'])
         df['time'] = pd.to_datetime(df['time'], unit='ms')
         df.set_index('time', inplace=False)
@@ -465,7 +474,7 @@ class MultiPairBot:
     def on_exit(self):
         """Attempt to notify Discord/Telegram that the bot is stopping."""
         try:
-            msg = f"🛑 Bot stopped: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}"
+            msg = f"🛑 Bot stopped: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}"
             self.send_alerts(msg)
             # small delay to allow network I/O to complete when possible
             time.sleep(0.5)
@@ -510,7 +519,7 @@ class MultiPairBot:
         finally:
             # ensure a final shutdown alert (also handled by atexit)
             try:
-                self.send_alerts(f"🟥 Bot exiting: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}")
+                self.send_alerts(f"🟥 Bot exiting: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}")
                 time.sleep(0.5)
             except Exception:
                 pass
