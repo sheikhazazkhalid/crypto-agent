@@ -1,4 +1,3 @@
-# ...existing code...
 import sys
 import pandas as pd
 import numpy as np
@@ -25,42 +24,77 @@ def wilder_rsi(series, period):
     rsi = 100 - (100 / (1 + rs))
     return rsi.fillna(50)
 
-def compare(symbol='BTC/USDT'):
-    bot = MultiPairBot(CONFIG)
+def compute_local_indicators(df, cfg):
+    df = df.copy().reset_index(drop=True)
+    # EMAs
+    ema_f = ewma(df['close'], cfg['ema_fast_span'])
+    ema_s = ewma(df['close'], cfg['ema_slow_span'])
+    ema_200 = ewma(df['close'], cfg.get('ema_200_span', 200))
+    # MACD / Signal
+    macd = ema_f - ema_s
+    signal = macd.ewm(span=cfg['macd_signal_span'], adjust=False).mean()
+    # RSI
+    rsi = wilder_rsi(df['close'], cfg['rsi_period'])
+    return pd.DataFrame({
+        'time': df['time'],
+        'close': df['close'],
+        'EMA_fast': ema_f,
+        'EMA_slow': ema_s,
+        'EMA_200': ema_200,
+        'MACD': macd,
+        'Signal': signal,
+        'RSI': rsi
+    })
+
+def compare_symbol(bot, cfg, symbol, rows=10):
+    print(f"\n=== VERIFY: {symbol} ===")
     df = bot.fetch_data(symbol).reset_index(drop=True)
     df_bot = bot.calculate_indicators(df).reset_index(drop=True)
+    df_local = compute_local_indicators(df, cfg)
 
-    cfg = CONFIG
-    ema_f, ema_s, macd, signal = compute_macd(df['close'], cfg['ema_fast_span'], cfg['ema_slow_span'], cfg['macd_signal_span'])
-    rsi_wilder = wilder_rsi(df['close'], cfg['rsi_period'])
+    n = min(rows, len(df))
+    start = len(df) - n
+    for i in range(start, len(df)):
+        t = df.at[i, 'time']
+        close = df.at[i, 'close']
+        print(f"\nROW {i} time={t} close={close}")
+        for col in ('EMA_fast','EMA_slow','EMA_200','MACD','Signal','RSI'):
+            a = df_bot.at[i, col] if col in df_bot.columns else np.nan
+            b = df_local.at[i, col]
+            try:
+                diff = float(a) - float(b)
+                print(f"  {col}: bot={a:.8f} local={b:.8f} diff={diff:.8f}")
+            except Exception:
+                print(f"  {col}: bot={a} local={b}")
 
-    rows = 10
-    print("\n--- LAST ROWS: bot vs local calc (no pandas_ta) ---\n")
-    for i in range(-rows, 0):
-        idx = len(df) + i
-        time = df.at[idx, 'time']
-        close = df.at[idx, 'close']
-        print(f"ROW {idx} time={time} close={close}")
-        print(f"  EMA_fast_bot={df_bot.at[idx,'EMA_fast']:.8f} / EMA_fast_local={ema_f.at[idx]:.8f}")
-        print(f"  EMA_slow_bot={df_bot.at[idx,'EMA_slow']:.8f} / EMA_slow_local={ema_s.at[idx]:.8f}")
-        print(f"  MACD_bot={df_bot.at[idx,'MACD']:.8f} / MACD_local={macd.at[idx]:.8f}")
-        print(f"  Signal_bot={df_bot.at[idx,'Signal']:.8f} / Signal_local={signal.at[idx]:.8f}")
-        print(f"  RSI_bot={df_bot.at[idx,'RSI']:.8f} / RSI_wilder={rsi_wilder.at[idx]:.8f}")
-        print("")
-
-    # diff summary last row
-    def diff(a,b,name):
-        try:
-            a=float(a); b=float(b); print(f"{name} diff: {a-b:.8f}")
-        except: print(f"{name}: n/a")
+    # summary last row diffs
     last = -1
     print("\n--- DIFF SUMMARY (last row) ---")
-    diff(df_bot['EMA_fast'].iloc[last], ema_f.iloc[last], 'EMA_fast')
-    diff(df_bot['EMA_slow'].iloc[last], ema_s.iloc[last], 'EMA_slow')
-    diff(df_bot['MACD'].iloc[last], macd.iloc[last], 'MACD')
-    diff(df_bot['Signal'].iloc[last], signal.iloc[last], 'Signal')
-    diff(df_bot['RSI'].iloc[last], rsi_wilder.iloc[last], 'RSI (wilder)')
+    def diff(a,b,name):
+        try:
+            a=float(a); b=float(b); d=a-b
+            print(f"{name} diff: {d:.8f}")
+        except Exception:
+            print(f"{name}: n/a")
+    diff(df_bot.at[last,'EMA_fast'], df_local.at[last,'EMA_fast'], 'EMA_fast')
+    diff(df_bot.at[last,'EMA_slow'], df_local.at[last,'EMA_slow'], 'EMA_slow')
+    diff(df_bot.at[last,'EMA_200'], df_local.at[last,'EMA_200'], 'EMA_200')
+    diff(df_bot.at[last,'MACD'], df_local.at[last,'MACD'], 'MACD')
+    diff(df_bot.at[last,'Signal'], df_local.at[last,'Signal'], 'Signal')
+    diff(df_bot.at[last,'RSI'], df_local.at[last,'RSI'], 'RSI (wilder)')
+
+def main():
+    bot = MultiPairBot(CONFIG)
+    # symbol argument optional; if not provided iterate all symbols in CONFIG
+    if len(sys.argv) > 1:
+        symbols = [sys.argv[1]]
+    else:
+        symbols = CONFIG.get('symbols', [])
+    for sym in symbols:
+        try:
+            compare_symbol(bot, CONFIG, sym, rows=10)
+        except Exception as e:
+            print(f"[error] {sym}: {e}")
 
 if __name__ == '__main__':
-    sym = sys.argv[1] if len(sys.argv)>1 else 'BTC/USDT'
-    compare(sym)
+    main()

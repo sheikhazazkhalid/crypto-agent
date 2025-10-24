@@ -29,47 +29,33 @@ CONFIG = {
     'discord_webhook': 'https://discord.com/api/webhooks/1430967851421798611/Lz1C4uPNljUJIWpOL5LDjI3FjnraGhBCrCa4omTSWJ8U-LYYN_0Ve8TEXSVdy30EJmI0',
     'discord_username': 'Azaz#8117',  # Optional custom username for webhook messages
 
-    # ==== Feature toggles (enable/disable indicators & S/R) ====
+    # Indicators / flow
     'enable_ema': True,
     'enable_macd': True,
     'enable_rsi': True,
     'enable_volume_avg': True,
-    'enable_sr': False,                # master toggle for support/resistance calculation
-    'enable_support': True,           # allow checking support condition for entries
-    'enable_resistance': True,        # allow checking resistance condition for entries
 
-    # ==== Cross options: use cross events instead of single-bar sign checks ====
-    'use_ema_cross': True,            # True => require EMA Fast crossing above EMA Slow (bullish cross)
-    'use_macd_cross': True,           # True => require MACD crossing above Signal (bullish cross)
+    # Risk Management
+    'trade_allocation': 0.10,         # % of available USDT balance per trade
+    'min_trade_usdt': 10.0,           # Minimum USDT per trade
+    'stop_loss_pct': 0.01,            # 1% stop loss
+    'take_profit_pct': 0.02,          # 2% take profit
 
-    # ==== Risk Management ====
-    'trade_allocation': 0.10,         # % of available USDT balance per trade (e.g., 5%)
-    'min_trade_usdt': 10.0,           # Minimum USDT per trade (to skip dust orders)
-    'stop_loss_pct': 0.01,           # 1% stop loss from entry price
-    'take_profit_pct': 0.02,          # 2% take profit target → 1:1 R:R ratio approx.
+    # Indicator params
+    'ema_fast_span': 12,
+    'ema_slow_span': 26,
+    'macd_signal_span': 9,
+    'rsi_period': 14,
+    'rsi_buy_threshold': 30,          # RSI drop threshold (watch)
+    'rsi_sell_threshold': 60,         # RSI recover threshold (abort watcher)
+    'ema_200_span': 200,              # 200 EMA filter
+    'cross_lookback': 8,              # how many past bars to scan for MACD cross after RSI drop
 
-    # ==== Indicator Config ====
-    'ema_fast_span': 12,              # Short-term EMA for trend detection
-    'ema_slow_span': 26,              # Long-term EMA for trend confirmation
-    'macd_signal_span': 9,            # MACD signal line smoothing period
-    'rsi_period': 14,                 # RSI lookback window
-    'rsi_buy_threshold': 30,          # Buy if RSI < 30
-    'rsi_sell_threshold': 60,         # Exit if RSI > 60 (momentum slowing)
+    # volume
+    'volume_avg_window': 20,
 
-    # ==== Support / Resistance ====
-    'sr_mode': 'pivot',               # Options: 'pivot', 'rolling', 'fractal'
-    'support_window': 50,             # Lookback window for rolling or fractal SR calc
-    'support_buffer_pct': 0.003,      # +0.3% above support → safe entry zone
-    'resistance_buffer_pct': 0.003,   # -0.3% below resistance → avoid buying too high
-
-    # ==== Breakout Confirmation (Optional) ====
-    'enable_breakout': True,          # Enable breakout validation logic
-    'breakout_close_bars': 2,         # Require 2 consecutive closes above resistance
-    'breakout_volume_multiplier': 1.5,# Volume must exceed avg_volume * multiplier
-    'volume_avg_window': 20,          # Lookback for average volume calculation
-
-    # new: minimum number of enabled checks required to enter (use 2 or 3 to be more permissive)
-    'min_checks_to_buy': 3,
+    # max concurrent open positions (<=0 means unlimited)
+    'max_open_positions': 0,
 }
 
 
@@ -86,6 +72,8 @@ class MultiPairBot:
         self.conn = sqlite3.connect('trades.db', check_same_thread=False)
         self.create_tables()
         self.positions = {symbol: None for symbol in cfg['symbols']}
+        # explicitly track RSI-drop watchers per symbol
+        self.rsi_drops = {symbol: None for symbol in cfg['symbols']}
         # register exit handler to notify on normal exit
         try:
             atexit.register(self.on_exit)
@@ -216,19 +204,20 @@ class MultiPairBot:
         c = self.cfg
         df = df.copy()
 
-        # safe helpers
         def safe_ewm(series, span):
             return series.ewm(span=span, adjust=False).mean()
 
-        # EMA
+        # EMAs (include 200 EMA used as trend filter)
         if c.get('enable_ema', True):
             df['EMA_fast'] = safe_ewm(df['close'], c['ema_fast_span'])
             df['EMA_slow'] = safe_ewm(df['close'], c['ema_slow_span'])
+            df['EMA_200'] = safe_ewm(df['close'], c.get('ema_200_span', 200))
         else:
             df['EMA_fast'] = np.nan
             df['EMA_slow'] = np.nan
+            df['EMA_200'] = np.nan
 
-        # MACD (depends on EMAs)
+        # MACD (simple MACD using EMA_fast - EMA_slow)
         if c.get('enable_macd', True) and c.get('enable_ema', True):
             df['MACD'] = df['EMA_fast'] - df['EMA_slow']
             df['Signal'] = df['MACD'].ewm(span=c['macd_signal_span'], adjust=False).mean()
@@ -236,43 +225,21 @@ class MultiPairBot:
             df['MACD'] = np.nan
             df['Signal'] = np.nan
 
-        # RSI
+        # RSI (Wilder)
         if c.get('enable_rsi', True):
             df['RSI'] = self.compute_rsi(df['close'], c['rsi_period'])
         else:
             df['RSI'] = np.nan
 
-        # Volume average
+        # volume average (kept)
         if c.get('enable_volume_avg', True):
             df['vol_avg'] = df['volume'].rolling(window=c['volume_avg_window']).mean()
         else:
             df['vol_avg'] = np.nan
 
-        # Support / Resistance calculation (master toggle)
-        if c.get('enable_sr', True):
-            mode = c.get('sr_mode', 'rolling').lower()
-            if mode == 'pivot':
-                df['Pivot'] = (df['high'] + df['low'] + df['close']) / 3
-                df['Support'] = (2 * df['Pivot']) - df['high']
-                df['Resistance'] = (2 * df['Pivot']) - df['low']
-                df['Support'] = df['Support'].rolling(window=3, min_periods=1).mean()
-                df['Resistance'] = df['Resistance'].rolling(window=3, min_periods=1).mean()
-            elif mode == 'fractal':
-                df['Support'] = df['low'].rolling(window=5, center=True).apply(
-                    lambda x: x[2] if x[2] == x.min() else np.nan, raw=True)
-                df['Resistance'] = df['high'].rolling(window=5, center=True).apply(
-                    lambda x: x[2] if x[2] == x.max() else np.nan, raw=True)
-                df['Support'] = df['Support'].ffill().bfill()
-                df['Resistance'] = df['Resistance'].ffill().bfill()
-            else:
-                df['Support'] = df['low'].rolling(window=c['support_window'], min_periods=1).min()
-                df['Resistance'] = df['high'].rolling(window=c['support_window'], min_periods=1).max()
-
-            df['Support'] = df['Support'].ffill().bfill()
-            df['Resistance'] = df['Resistance'].ffill().bfill()
-        else:
-            df['Support'] = np.nan
-            df['Resistance'] = np.nan
+        # remove support/resistance from previous logic (not used)
+        df['Support'] = np.nan
+        df['Resistance'] = np.nan
 
         return df
 
@@ -285,13 +252,14 @@ class MultiPairBot:
         usdt = free.get('USDT', free.get('USD', 0.0))
         return {'USDT': usdt}
 
-    def place_order(self, symbol, side, amount, price):
+    def place_order(self, symbol, side, amount, price, notify=True):
         timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
         if self.cfg['dry_run']:
             msg = f"[DRY RUN] {timestamp} | {symbol} | {side.upper()} {amount:.8f} @ {price:.8f}"
             print(msg)
-            # send telegram + discord alert for simulation too
-            self.send_alerts(f"🟡 {msg}")
+            # send telegram + discord alert for simulation only when notify is True
+            if notify:
+                self.send_alerts(f"🟡 {msg}")
             return {'symbol': symbol, 'side': side, 'price': price, 'amount': amount}
         else:
             # market order (price not used by API, kept for logging)
@@ -304,7 +272,8 @@ class MultiPairBot:
             executed_amount = float(order.get('amount', amount)) if isinstance(order, dict) else amount
             msg = f"[EXECUTED] {timestamp} | {symbol} | {side.upper()} {executed_amount:.8f} @ {executed_price:.8f}"
             print(msg)
-            self.send_alerts(f"✅ {msg}")
+            if notify:
+                self.send_alerts(f"✅ {msg}")
             return order
 
     def log_trade(self, symbol, order, sl, tp):
@@ -329,9 +298,9 @@ class MultiPairBot:
         pnl = (close_price - pos['price']) * pos['amount'] if pos['side'] == 'buy' else (pos['price'] - close_price) * pos['amount']
         # place market sell for long
         if pos['side'] == 'buy':
-            self.place_order(symbol, 'sell', pos['amount'], close_price)
+            self.place_order(symbol, 'sell', pos['amount'], close_price, notify=False)
         else:
-            self.place_order(symbol, 'buy', pos['amount'], close_price)
+            self.place_order(symbol, 'buy', pos['amount'], close_price, notify=False)
 
         # update DB entry (we stored trade_id in pos)
         trade_id = pos.get('trade_id')
@@ -341,7 +310,7 @@ class MultiPairBot:
         msg = f"💰 {symbol}: Trade closed | P/L {pnl:.4f} USDT"
         print(msg)
         # telegram + discord alert on close
-        self.send_alerts(f"🔴 {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} | {msg}")
+        self.send_alerts(f"🔴 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} | {msg}")
         self.positions[symbol] = None
 
     def breakout_confirmed(self, df):
@@ -373,6 +342,13 @@ class MultiPairBot:
         return closes_ok and vol_ok
 
     def trade_logic(self, symbol, df):
+        """
+        New simplified flow:
+         1) If RSI drops below rsi_buy_threshold -> mark symbol as watching (rsi_drops)
+         2) While watching, wait for MACD bullish cross that occurs AFTER the RSI drop
+         3) When cross confirmed and latest price > EMA_200 -> BUY with SL/TP (as configured)
+         4) Clear watcher on buy or if RSI recovers above rsi_sell_threshold
+        """
         c = self.cfg
         latest = df.iloc[-1]
         balance = self.get_balance()
@@ -381,27 +357,17 @@ class MultiPairBot:
         trade_amount = trade_amount_usdt / current_price
         pos = self.positions.get(symbol)
 
-        # helper for pretty printing values that might be NaN
         def fmt(x, prec=4):
             try:
                 return f"{float(x):.{prec}f}"
             except Exception:
                 return "n/a"
 
-        # --- Live Indicator Snapshot ---
         print(f"\n[{symbol}] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"Price: {current_price:.4f} | EMA Fast: {fmt(latest.get('EMA_fast'))} | EMA Slow: {fmt(latest.get('EMA_slow'))}")
-        print(f"MACD: {fmt(latest.get('MACD'),6)} | Signal: {fmt(latest.get('Signal'),6)} | RSI: {fmt(latest.get('RSI'),2)}")
-        print(f"Support: {fmt(latest.get('Support'))} | Resistance: {fmt(latest.get('Resistance'))} | Vol Avg: {fmt(latest.get('vol_avg'))}")
+        print(f"Price: {current_price:.4f} | RSI: {fmt(latest.get('RSI'))} | MACD: {fmt(latest.get('MACD'),6)} | Signal: {fmt(latest.get('Signal'),6)} | EMA200: {fmt(latest.get('EMA_200'))}")
 
+        # Manage existing trade (SL/TP)
         if pos:
-            print(f"→ Open {pos['side'].upper()} @ {pos['price']:.4f} | SL: {pos['stop_loss']:.4f} | TP: {pos['take_profit']:.4f}")
-        else:
-            print("→ No open position")
-
-        # --- Manage Existing Trades ---
-        if pos:
-            # stop loss or take profit check
             if current_price <= pos['stop_loss']:
                 print(f"⚠️  {symbol}: STOP-LOSS triggered at {current_price:.4f}")
                 self.close_position(symbol, current_price)
@@ -411,71 +377,71 @@ class MultiPairBot:
                 self.close_position(symbol, current_price)
                 return
 
-        # --- Entry Logic ---
+        # New entry flow only
         if not pos:
-            # Build list of enabled checks (booleans)
-            checks = []
+            # 1) Record RSI drop -> start watcher
+            rsi_val = None
+            try:
+                rsi_val = float(latest['RSI'])
+            except Exception:
+                pass
 
-            # EMA: either cross event or simple sign check based on config
-            if c.get('enable_ema', True):
-                if c.get('use_ema_cross', True):
-                    checks.append(self.is_bullish_ema_cross(df))
-                else:
-                    checks.append(latest['EMA_fast'] > latest['EMA_slow'])
+            if rsi_val is not None:
+                if rsi_val < c.get('rsi_buy_threshold', 30):
+                    if getattr(self, 'rsi_drops', None) is None:
+                        self.rsi_drops = {s: None for s in c['symbols']}
+                    if self.rsi_drops.get(symbol) is None:
+                        self.rsi_drops[symbol] = latest.get('time') or pd.Timestamp.now()
+                        print(f"🔎 {symbol}: RSI dropped below {c.get('rsi_buy_threshold')} ({rsi_val:.2f}) — watching for MACD bullish cross")
+                elif rsi_val > c.get('rsi_sell_threshold', 60):
+                    if getattr(self, 'rsi_drops', None) and self.rsi_drops.get(symbol) is not None:
+                        print(f"↩️ {symbol}: RSI recovered ({rsi_val:.2f}) — clearing watcher")
+                    if getattr(self, 'rsi_drops', None):
+                        self.rsi_drops[symbol] = None
 
-            # MACD: either cross event or simple sign check based on config
-            if c.get('enable_macd', True):
-                if c.get('use_macd_cross', True):
-                    checks.append(self.is_bullish_macd_cross(df))
-                else:
-                    checks.append(latest['MACD'] > latest['Signal'])
+            # 2) If watching, search for MACD bullish cross after recorded RSI-drop time
+            watch_time = getattr(self, 'rsi_drops', {}).get(symbol)
+            if watch_time is not None:
+                macd_cross_time = None
+                if c.get('enable_macd', True):
+                    macd_cross_time = self.find_bullish_macd_cross_time(df, lookback=c.get('cross_lookback', 8))
+                if macd_cross_time is not None and pd.to_datetime(macd_cross_time) >= pd.to_datetime(watch_time):
+                    # 3) Confirm trend: price above 200 EMA
+                    ema200 = latest.get('EMA_200', np.nan)
+                    if not np.isnan(ema200) and current_price > float(ema200):
+                        # enforce max open positions limit
+                        if not self.can_open_new_trade():
+                            print(f"⛔ {symbol}: max open positions reached ({self.get_open_positions_count()}/{c.get('max_open_positions')}) - skipping buy")
+                            # keep watcher active; do not clear so buy can occur later
+                            return
 
-            if c.get('enable_rsi', True):
-                checks.append(latest['RSI'] < c['rsi_buy_threshold'])
+                        stop_loss = current_price * (1 - c['stop_loss_pct'])
+                        take_profit = current_price * (1 + c['take_profit_pct'])
+                        order = self.place_order(symbol, 'buy', trade_amount, current_price, notify=False)
+                        trade_id = self.log_trade(symbol, order, stop_loss, take_profit)
+                        self.positions[symbol] = {
+                            'side': 'buy',
+                            'price': current_price,
+                            'amount': trade_amount,
+                            'stop_loss': stop_loss,
+                            'take_profit': take_profit,
+                            'trade_id': trade_id
+                        }
 
-            if c.get('enable_support', True) and not np.isnan(latest.get('Support', np.nan)):
-                checks.append(current_price > latest['Support'] * (1 + c['support_buffer_pct']))
+                        reason = "RSI_DROP+MACD_CROSS+EMA200"
+                        print(f"✅ {symbol}: BUY @ {current_price:.4f} | SL {stop_loss:.4f} | TP {take_profit:.4f} | REASON: {reason}")
 
-            if c.get('enable_resistance', True) and not np.isnan(latest.get('Resistance', np.nan)):
-                checks.append(current_price < latest['Resistance'] * (1 - c['resistance_buffer_pct']))
+                        # send detailed alert (includes SL/TP) after position is recorded
+                        timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+                        alert_msg = (f"🟢 {timestamp} | {symbol} | BUY {trade_amount:.8f} @ {current_price:.8f} "
+                                     f"| SL {stop_loss:.8f} | TP {take_profit:.8f} | REASON: {reason}")
+                        self.send_alerts(alert_msg)
 
-            # require at least min_checks_to_buy of the enabled checks to be true
-            enabled_checks_count = len(checks)
-            true_checks = sum(1 for v in checks if bool(v))
-            min_req = int(c.get('min_checks_to_buy', 2))
-            buy_condition_base = (enabled_checks_count > 0) and (true_checks >= min_req)
-
-            # Breakout entry: price closes above resistance + confirmation (only if breakout enabled)
-            breakout_condition = False
-            if c.get('enable_breakout', False) and not np.isnan(latest.get('Resistance', np.nan)):
-                if current_price > latest['Resistance'] * (1 + c['resistance_buffer_pct']):
-                    breakout_condition = self.breakout_confirmed(df)
-
-            # Final decision: either safe reversal buy OR breakout buy
-            if buy_condition_base or breakout_condition:
-                stop_loss = current_price * (1 - c['stop_loss_pct'])
-                take_profit = current_price * (1 + c['take_profit_pct'])
-                order = self.place_order(symbol, 'buy', trade_amount, current_price)
-
-                # log trade and keep track of trade id in memory
-                trade_id = self.log_trade(symbol, order, stop_loss, take_profit)
-                self.positions[symbol] = {
-                    'side': 'buy',
-                    'price': current_price,
-                    'amount': trade_amount,
-                    'stop_loss': stop_loss,
-                    'take_profit': take_profit,
-                    'trade_id': trade_id
-                }
-
-                reason = "BREAKOUT" if breakout_condition else "CHANNEL_ENTRY"
-                print(f"✅ {symbol}: BUY @ {current_price:.4f} | SL {stop_loss:.4f} | TP {take_profit:.4f} | REASON: {reason}")
-
-                # send detailed alert (includes SL/TP) after position is recorded
-                timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
-                alert_msg = (f"🟢 {timestamp} | {symbol} | BUY {trade_amount:.8f} @ {current_price:.8f} "
-                             f"| SL {stop_loss:.8f} | TP {take_profit:.8f} | REASON: {reason}")
-                self.send_alerts(alert_msg)
+                        # clear watcher
+                        self.rsi_drops[symbol] = None
+                    else:
+                        print(f"⛔ {symbol}: MACD crossed after RSI drop but EMA200 filter failed ({current_price:.4f} <= {ema200 if not np.isnan(ema200) else 'n/a'})")
+                # else: keep waiting
 
     def summarize_performance(self):
         df = pd.read_sql('SELECT * FROM trades', self.conn)
@@ -567,6 +533,36 @@ class MultiPairBot:
             return False
         return (m_prev <= s_prev) and (m_cur > s_cur)
     # --- end new helpers ---
+
+    def find_bullish_macd_cross_time(self, df, lookback=None):
+        """Scan the last `lookback` closed candles for MACD crossing above Signal.
+        Return timestamp of the cross candle (pd.Timestamp) or None.
+        """
+        if lookback is None:
+            lookback = int(self.cfg.get('cross_lookback', 8))
+        if len(df) < 2:
+            return None
+        start = max(1, len(df) - lookback)
+        for i in range(start, len(df)):
+            try:
+                prev = df.iloc[i - 1]
+                cur = df.iloc[i]
+                if (float(prev['MACD']) <= float(prev['Signal'])) and (float(cur['MACD']) > float(cur['Signal'])):
+                    return cur.get('time') or cur.name
+            except Exception:
+                continue
+        return None
+
+    def get_open_positions_count(self):
+        """Return number of currently open positions tracked in memory."""
+        return sum(1 for p in self.positions.values() if p)
+
+    def can_open_new_trade(self):
+        """Check configured limit; return True if we may open another trade."""
+        maxp = int(self.cfg.get('max_open_positions', 0) or 0)
+        if maxp <= 0:
+            return True  # unlimited
+        return self.get_open_positions_count() < maxp
 
 if __name__ == '__main__':
     bot = MultiPairBot(CONFIG)
