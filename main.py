@@ -56,6 +56,10 @@ CONFIG = {
 
     # max concurrent open positions (<=0 means unlimited)
     'max_open_positions': 0,
+
+    # order type
+    'order_type': 'market',  # 'market' or 'limit'
+    'limit_price_buffer_pct': 0.001,  # 0.1% buffer for limit orders (above for buy, below for sell)
 }
 
 
@@ -254,23 +258,32 @@ class MultiPairBot:
 
     def place_order(self, symbol, side, amount, price, notify=True):
         timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+        order_type = self.cfg.get('order_type', 'market')
         if self.cfg['dry_run']:
-            msg = f"[DRY RUN] {timestamp} | {symbol} | {side.upper()} {amount:.8f} @ {price:.8f}"
+            msg = f"[DRY RUN] {timestamp} | {symbol} | {side.upper()} {amount:.8f} @ {price:.8f} ({order_type})"
             print(msg)
-            # send telegram + discord alert for simulation only when notify is True
             if notify:
                 self.send_alerts(f"🟡 {msg}")
             return {'symbol': symbol, 'side': side, 'price': price, 'amount': amount}
         else:
-            # market order (price not used by API, kept for logging)
-            if side.lower() == 'buy':
-                order = self.client.create_market_buy_order(symbol, amount)
+            if order_type == 'limit':
+                # calculate limit price with buffer
+                buffer = self.cfg.get('limit_price_buffer_pct', 0.001)
+                if side.lower() == 'buy':
+                    limit_price = price * (1 + buffer)  # buy slightly above
+                else:
+                    limit_price = price * (1 - buffer)  # sell slightly below
+                order = self.client.create_limit_order(symbol, side, amount, limit_price)
             else:
-                order = self.client.create_market_sell_order(symbol, amount)
-            # try to extract price/amount for message (fallback to provided)
+                # market order
+                if side.lower() == 'buy':
+                    order = self.client.create_market_buy_order(symbol, amount)
+                else:
+                    order = self.client.create_market_sell_order(symbol, amount)
+            # extract executed details
             executed_price = float(order.get('price', price)) if isinstance(order, dict) else price
             executed_amount = float(order.get('amount', amount)) if isinstance(order, dict) else amount
-            msg = f"[EXECUTED] {timestamp} | {symbol} | {side.upper()} {executed_amount:.8f} @ {executed_price:.8f}"
+            msg = f"[EXECUTED] {timestamp} | {symbol} | {side.upper()} {executed_amount:.8f} @ {executed_price:.8f} ({order_type})"
             print(msg)
             if notify:
                 self.send_alerts(f"✅ {msg}")
