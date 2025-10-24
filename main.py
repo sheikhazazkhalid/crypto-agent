@@ -15,7 +15,7 @@ CONFIG = {
     # ==== Exchange / General ====
     'api_key': '',                    # Binance/Bybit API key (optional for dry-run)
     'api_secret': '',                 # Binance/Bybit API secret (optional for dry-run)
-    'symbols': ['BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'XRP/USDT', 'SOL/USDT', 'ADA/USDT', 'LINK/USDT', 'AVAX/USDT', 'POL/USDT', 'LTC/USDT', 'DOT/USDT'],
+    'symbols': ['BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'XRP/USDT', 'SOL/USDT', 'ADA/USDT', 'LINK/USDT', 'AVAX/USDT', 'POL/USDT', 'LTC/USDT', 'DOT/USDT', 'ATOM/USDT'],
     'timeframe': '5m',                # Candle interval: 5m gives smoother signals than 1m
     'limit': 300,                     # Number of candles to fetch (for indicators)
     'poll_interval': 30,              # Seconds between each data fetch / cycle
@@ -404,8 +404,8 @@ class MultiPairBot:
             if watch_time is not None:
                 macd_cross_time = None
                 if c.get('enable_macd', True):
-                    macd_cross_time = self.find_bullish_macd_cross_time(df, lookback=c.get('cross_lookback', 8))
-                if macd_cross_time is not None and pd.to_datetime(macd_cross_time) >= pd.to_datetime(watch_time):
+                    macd_cross_time = self.find_bullish_macd_cross_time(df, lookback=c.get('cross_lookback', 8), after_time=watch_time)
+                if macd_cross_time is not None:
                     # 3) Confirm trend: price above 200 EMA
                     ema200 = latest.get('EMA_200', np.nan)
                     if not np.isnan(ema200) and current_price > float(ema200):
@@ -534,9 +534,9 @@ class MultiPairBot:
         return (m_prev <= s_prev) and (m_cur > s_cur)
     # --- end new helpers ---
 
-    def find_bullish_macd_cross_time(self, df, lookback=None):
-        """Scan the last `lookback` closed candles for MACD crossing above Signal.
-        Return timestamp of the cross candle (pd.Timestamp) or None.
+    def find_bullish_macd_cross_time(self, df, lookback=None, after_time=None):
+        """Scan the last `lookback` closed candles for the FIRST MACD crossing above Signal AFTER `after_time`.
+        Return timestamp of the first qualifying cross candle (pd.Timestamp) or None.
         """
         if lookback is None:
             lookback = int(self.cfg.get('cross_lookback', 8))
@@ -547,8 +547,11 @@ class MultiPairBot:
             try:
                 prev = df.iloc[i - 1]
                 cur = df.iloc[i]
-                if (float(prev['MACD']) <= float(prev['Signal'])) and (float(cur['MACD']) > float(cur['Signal'])):
-                    return cur.get('time') or cur.name
+                cross_happened = (float(prev['MACD']) <= float(prev['Signal'])) and (float(cur['MACD']) > float(cur['Signal']))
+                if cross_happened:
+                    cross_time = cur.get('time') or cur.name
+                    if after_time is None or pd.to_datetime(cross_time) > pd.to_datetime(after_time):
+                        return cross_time  # return the FIRST one after after_time
             except Exception:
                 continue
         return None
