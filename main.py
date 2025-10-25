@@ -39,7 +39,7 @@ CONFIG = {
     'trade_allocation': 0.10,         # % of available USDT balance per trade
     'min_trade_usdt': 10.0,           # Minimum USDT per trade
     'stop_loss_pct': 0.01,            # 1% stop loss
-    'take_profit_pct': 0.02,          # 2% take profit
+    'take_profit_pct': 0.015,         # 1.5% take profit
 
     # Indicator params
     'ema_fast_span': 12,
@@ -60,7 +60,7 @@ CONFIG = {
     # order type
     'order_type': 'market',  # 'market' or 'limit'
     'limit_price_buffer_pct': 0.001,  # 0.1% buffer for limit orders (above for buy, below for sell)
-    'exchange_for_data': 'binance',  # 'binanceus' for data (works on US cloud), 'binance' for global
+    'exchange_for_data': 'binanceus',  # 'binanceus' for data (works on US cloud), 'binance' for global
     'exchange_for_trading': 'binance', # 'binance' for global trading (your account), 'binanceus' for US
 }
 
@@ -428,6 +428,11 @@ class MultiPairBot:
                 if c.get('enable_macd', True):
                     macd_cross_time = self.find_bullish_macd_cross_time(df, lookback=c.get('cross_lookback', 8), after_time=watch_time)
                 if macd_cross_time is not None:
+                    # Additional check: ensure MACD is still bullish at the latest bar
+                    macd_bullish_now = latest.get('MACD', np.nan) > latest.get('Signal', np.nan)
+                    if not macd_bullish_now:
+                        print(f"⛔ {symbol}: MACD cross found but MACD not bullish at latest bar — skipping buy")
+                        return  # keep watcher active
                     # 3) Confirm trend: price above 200 EMA
                     ema200 = latest.get('EMA_200', np.nan)
                     if not np.isnan(ema200) and current_price > float(ema200):
