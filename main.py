@@ -34,6 +34,9 @@ CONFIG = {
     'enable_macd': True,
     'enable_rsi': True,
     'enable_volume_avg': True,
+    # New: entry volume confirmation (optional)
+    'enable_volume_confirmation': False,  # set True to require volume confirmation on entries
+    'volume_confirm_multiplier': 1.2,     # require volume >= multiplier * vol_avg
 
     # Risk Management
     'trade_allocation': 0.10,         # % of available USDT balance per trade
@@ -47,7 +50,6 @@ CONFIG = {
     'macd_signal_span': 9,
     'rsi_period': 14,
     'rsi_buy_threshold': 30,          # RSI drop threshold (watch)
-    'rsi_sell_threshold': 60,         # RSI recover threshold (abort watcher)
     'ema_200_span': 200,              # 200 EMA filter
     'cross_lookback': 8,              # how many past bars to scan for MACD cross after RSI drop
 
@@ -60,7 +62,7 @@ CONFIG = {
     # order type
     'order_type': 'market',  # 'market' or 'limit'
     'limit_price_buffer_pct': 0.001,  # 0.1% buffer for limit orders (above for buy, below for sell)
-    'exchange_for_data': 'binanceus',  # 'binanceus' for data (works on US cloud), 'binance' for global
+    'exchange_for_data': 'mexc',  
     'exchange_for_trading': 'binance', # 'binance' for global trading (your account), 'binanceus' for US
 }
 
@@ -92,24 +94,6 @@ class MultiPairBot:
         except Exception:
             pass
 
-    # Telegram helper
-    def send_telegram_alert(self, text: str):
-        token = self.cfg.get('telegram_token') or ''
-        chat_id = self.cfg.get('telegram_chat_id') or ''
-        if not token or not chat_id:
-            return  # no creds provided
-        try:
-            base = f"https://api.telegram.org/bot{token}/sendMessage"
-            data = urllib.parse.urlencode({
-                'chat_id': chat_id,
-                'text': text,
-                'parse_mode': 'HTML'
-            }).encode()
-            req = urllib.request.Request(base, data=data)
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                resp.read()
-        except Exception as e:
-            print(f"[Telegram error] {e}")
 
     # Discord helper
     def send_discord_alert(self, text: str):
@@ -146,7 +130,6 @@ class MultiPairBot:
     # Convenience to send both (if configured)
     def send_alerts(self, text: str):
         # run both; failures are printed inside helpers
-        self.send_telegram_alert(text)
         self.send_discord_alert(text)
 
     def create_tables(self):
@@ -197,7 +180,8 @@ class MultiPairBot:
         ohlcv = self.data_client.fetch_ohlcv(symbol, self.cfg['timeframe'], limit=self.cfg['limit'])
         df = pd.DataFrame(ohlcv, columns=['time','open','high','low','close','volume'])
         df['time'] = pd.to_datetime(df['time'], unit='ms')
-        df.set_index('time', inplace=False)
+        # set time as index so row.name / .index timestamps are reliable for comparisons
+        df.set_index('time', inplace=True)
         return df
 
     def compute_rsi(self, prices, period):
@@ -335,33 +319,6 @@ class MultiPairBot:
         self.send_alerts(f"🔴 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} | {msg}")
         self.positions[symbol] = None
 
-    def breakout_confirmed(self, df):
-        """
-        Return True if breakout confirmation criteria are met:
-         - last N closes above resistance*(1 + resistance_buffer_pct)
-         - last bar volume > avg_volume * multiplier OR average of last N volumes > ...
-        """
-        c = self.cfg
-        n = c['breakout_close_bars']
-        if len(df) < max(n, c['volume_avg_window']) + 1:
-            return False
-
-        # use last n bars (most recent at -1)
-        recent = df.iloc[-n:]
-        # compute dynamic resistance values for these bars (we have per-row Resistance)
-        # For breakout we compare closes to their corresponding resistance (use last resistance)
-        last_resistance = df['Resistance'].iloc[-1]
-        threshold = last_resistance * (1 + c['resistance_buffer_pct'])
-
-        # 1) consecutive closes above threshold
-        closes_ok = (recent['close'] > threshold).all()
-
-        # 2) volume check: last bar volume > avg_volume * multiplier
-        last_vol = df['volume'].iloc[-1]
-        avg_vol = df['vol_avg'].iloc[-1] if not np.isnan(df['vol_avg'].iloc[-1]) else df['volume'].rolling(window=c['volume_avg_window'], min_periods=1).mean().iloc[-1]
-        vol_ok = last_vol > (avg_vol * c['breakout_volume_multiplier'])
-
-        return closes_ok and vol_ok
 
     def trade_logic(self, symbol, df):
         """
@@ -369,7 +326,7 @@ class MultiPairBot:
          1) If RSI drops below rsi_buy_threshold -> mark symbol as watching (rsi_drops)
          2) While watching, wait for MACD bullish cross that occurs AFTER the RSI drop
          3) When cross confirmed and latest price > EMA_200 -> BUY with SL/TP (as configured)
-         4) Clear watcher on buy or if RSI recovers above rsi_sell_threshold
+         4) Optional: require volume confirmation (current volume >= multiplier * vol_avg)
         """
         c = self.cfg
         latest = df.iloc[-1]
@@ -386,7 +343,11 @@ class MultiPairBot:
                 return "n/a"
 
         print(f"\n[{symbol}] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"Price: {current_price:.4f} | RSI: {fmt(latest.get('RSI'))} | MACD: {fmt(latest.get('MACD'),6)} | Signal: {fmt(latest.get('Signal'),6)} | EMA200: {fmt(latest.get('EMA_200'))}")
+        print(
+            f"Price: {current_price:.4f} | RSI: {fmt(latest.get('RSI'))} | MACD: {fmt(latest.get('MACD'),6)} | "
+            f"Signal: {fmt(latest.get('Signal'),6)} | EMA200: {fmt(latest.get('EMA_200'))} | "
+            f"Vol: {fmt(latest.get('volume'))} | VAvg: {fmt(latest.get('vol_avg'))}"
+        )
 
         # Manage existing trade (SL/TP)
         if pos:
@@ -409,18 +370,27 @@ class MultiPairBot:
                 pass
 
             if rsi_val is not None:
-                if rsi_val < c.get('rsi_buy_threshold', 30):
+                # require an actual CROSS down into the buy zone: previous RSI must be >= threshold
+                buy_th = float(c.get('rsi_buy_threshold', 30))
+                prev_rsi = None
+                if len(df) >= 2:
+                    try:
+                        prev_rsi = float(df['RSI'].iloc[-2])
+                    except Exception:
+                        prev_rsi = None
+
+                if rsi_val < buy_th and (prev_rsi is None or prev_rsi >= buy_th):
                     if getattr(self, 'rsi_drops', None) is None:
                         self.rsi_drops = {s: None for s in c['symbols']}
                     if self.rsi_drops.get(symbol) is None:
-                        self.rsi_drops[symbol] = latest.get('time') or pd.Timestamp.now()
-                        print(f"🔎 {symbol}: RSI dropped below {c.get('rsi_buy_threshold')} ({rsi_val:.2f}) — watching for MACD bullish cross")
-                elif rsi_val > c.get('rsi_sell_threshold', 60):
-                    if getattr(self, 'rsi_drops', None) and self.rsi_drops.get(symbol) is not None:
-                        print(f"↩️ {symbol}: RSI recovered ({rsi_val:.2f}) — clearing watcher")
-                    if getattr(self, 'rsi_drops', None):
-                        self.rsi_drops[symbol] = None
-
+                        # prefer indexed candle timestamp if available
+                        try:
+                            watch_time = df.index[-1]
+                        except Exception:
+                            watch_time = latest.get('time') or pd.Timestamp.now()
+                        self.rsi_drops[symbol] = watch_time
+                        print(f"🔎 {symbol}: RSI crossed below {buy_th} ({rsi_val:.2f}) — watching for MACD bullish cross")
+                # NOTE: do NOT clear watcher on RSI recovery here — keep watching until a MACD cross is processed
             # 2) If watching, search for MACD bullish cross after recorded RSI-drop time
             watch_time = getattr(self, 'rsi_drops', {}).get(symbol)
             if watch_time is not None:
@@ -428,19 +398,42 @@ class MultiPairBot:
                 if c.get('enable_macd', True):
                     macd_cross_time = self.find_bullish_macd_cross_time(df, lookback=c.get('cross_lookback', 8), after_time=watch_time)
                 if macd_cross_time is not None:
+                    # advance watcher to the cross time so we don't repeatedly process the same cross
+                    self.rsi_drops[symbol] = macd_cross_time
+
                     # Additional check: ensure MACD is still bullish at the latest bar
                     macd_bullish_now = latest.get('MACD', np.nan) > latest.get('Signal', np.nan)
                     if not macd_bullish_now:
-                        print(f"⛔ {symbol}: MACD cross found but MACD not bullish at latest bar — skipping buy")
-                        return  # keep watcher active
+                        print(f"⛔ {symbol}: MACD cross found at {macd_cross_time} but MACD not bullish at latest bar — skipping buy for this cross (will watch for next cross)")
+                        return  # keep watcher active (advanced), wait for next cross
+
                     # 3) Confirm trend: price above 200 EMA
                     ema200 = latest.get('EMA_200', np.nan)
                     if not np.isnan(ema200) and current_price > float(ema200):
+                        # Optional volume confirmation
+                        if c.get('enable_volume_confirmation', False):
+                            try:
+                                cur_vol = float(latest.get('volume', np.nan))
+                            except Exception:
+                                cur_vol = np.nan
+                            vavg = latest.get('vol_avg', np.nan)
+                            if np.isnan(vavg):
+                                # fallback compute if vol_avg disabled or not ready
+                                try:
+                                    vavg = float(df['volume'].rolling(window=c.get('volume_avg_window', 20)).mean().iloc[-1])
+                                except Exception:
+                                    vavg = np.nan
+                            multiplier = float(c.get('volume_confirm_multiplier', 1.0))
+                            vol_ok = (not np.isnan(cur_vol)) and (not np.isnan(vavg)) and (cur_vol >= multiplier * vavg)
+                            if not vol_ok:
+                                print(f"⛔ {symbol}: Volume confirmation failed at cross — vol {fmt(cur_vol)} < {multiplier}× vavg {fmt(vavg)} (skipping buy for this cross)")
+                                # Clear watcher on volume confirmation failure
+                                self.rsi_drops[symbol] = None
+
                         # enforce max open positions limit
                         if not self.can_open_new_trade():
                             print(f"⛔ {symbol}: max open positions reached ({self.get_open_positions_count()}/{c.get('max_open_positions')}) - skipping buy")
-                            # keep watcher active; do not clear so buy can occur later
-                            return
+                            return  # keep watcher active (already advanced)
 
                         stop_loss = current_price * (1 - c['stop_loss_pct'])
                         take_profit = current_price * (1 + c['take_profit_pct'])
@@ -464,10 +457,11 @@ class MultiPairBot:
                                      f"| SL {stop_loss:.8f} | TP {take_profit:.8f} | REASON: {reason}")
                         self.send_alerts(alert_msg)
 
-                        # clear watcher
+                        # clear watcher on successful buy
                         self.rsi_drops[symbol] = None
                     else:
-                        print(f"⛔ {symbol}: MACD crossed after RSI drop but EMA200 filter failed ({current_price:.4f} <= {ema200 if not np.isnan(ema200) else 'n/a'})")
+                       print(f"⛔ {symbol}: MACD crossed at {macd_cross_time} after RSI drop but EMA200 filter failed ({current_price:.4f} <= {ema200 if not np.isnan(ema200) else 'n/a'}) — clearing watcher for this RSI-drop")
+                       self.rsi_drops[symbol] = None
                 # else: keep waiting
 
     def summarize_performance(self):

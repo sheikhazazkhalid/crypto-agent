@@ -1,4 +1,5 @@
 import sys
+from time import sleep
 import pandas as pd
 import numpy as np
 
@@ -48,8 +49,12 @@ def compute_local_indicators(df, cfg):
 
 def compare_symbol(bot, cfg, symbol, rows=10):
     print(f"\n=== VERIFY: {symbol} ===")
-    df = bot.fetch_data(symbol).reset_index(drop=True)
-    df_bot = bot.calculate_indicators(df).reset_index(drop=True)
+    # keep the 'time' column when resetting index so comparisons use timestamps
+    df = bot.fetch_data(symbol).reset_index()
+    if df.empty:
+        print(f"No data available for {symbol} — skipping.")
+        return
+    df_bot = bot.calculate_indicators(df).reset_index()
     df_local = compute_local_indicators(df, cfg)
 
     n = min(rows, len(df))
@@ -76,12 +81,19 @@ def compare_symbol(bot, cfg, symbol, rows=10):
             print(f"{name} diff: {d:.8f}")
         except Exception:
             print(f"{name}: n/a")
-    diff(df_bot.at[last,'EMA_fast'], df_local.at[last,'EMA_fast'], 'EMA_fast')
-    diff(df_bot.at[last,'EMA_slow'], df_local.at[last,'EMA_slow'], 'EMA_slow')
-    diff(df_bot.at[last,'EMA_200'], df_local.at[last,'EMA_200'], 'EMA_200')
-    diff(df_bot.at[last,'MACD'], df_local.at[last,'MACD'], 'MACD')
-    diff(df_bot.at[last,'Signal'], df_local.at[last,'Signal'], 'Signal')
-    diff(df_bot.at[last,'RSI'], df_local.at[last,'RSI'], 'RSI (wilder)')
+    if len(df_bot) > 0 and len(df_local) > 0:
+        # use positional indexing (.iloc) to get the last row reliably
+        try:
+            diff(df_bot.iloc[last]['EMA_fast'],  df_local.iloc[last]['EMA_fast'],  'EMA_fast')
+            diff(df_bot.iloc[last]['EMA_slow'],  df_local.iloc[last]['EMA_slow'],  'EMA_slow')
+            diff(df_bot.iloc[last]['EMA_200'],   df_local.iloc[last]['EMA_200'],   'EMA_200')
+            diff(df_bot.iloc[last]['MACD'],      df_local.iloc[last]['MACD'],      'MACD')
+            diff(df_bot.iloc[last]['Signal'],    df_local.iloc[last]['Signal'],    'Signal')
+            diff(df_bot.iloc[last]['RSI'],       df_local.iloc[last]['RSI'],       'RSI (wilder)')
+        except Exception as e:
+            print(f"diff summary failed: {e}")
+    else:
+        print("No data for diff summary.")
 
 def main():
     bot = MultiPairBot(CONFIG)
@@ -93,6 +105,7 @@ def main():
     for sym in symbols:
         try:
             compare_symbol(bot, CONFIG, sym, rows=10)
+            sleep(1)  # to avoid rate limits
         except Exception as e:
             print(f"[error] {sym}: {e}")
 
