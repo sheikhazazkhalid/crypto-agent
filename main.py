@@ -432,8 +432,10 @@ class MultiPairBot:
 
                         # enforce max open positions limit
                         if not self.can_open_new_trade():
-                            print(f"⛔ {symbol}: max open positions reached ({self.get_open_positions_count()}/{c.get('max_open_positions')}) - skipping buy")
-                            return  # keep watcher active (already advanced)
+                            print(f"⛔ {symbol}: max open positions reached ({self.get_open_positions_count()}/{c.get('max_open_positions')}) - skipping buy and clearing watcher")
+                            # Clear watcher so we don't keep reprocessing this setup when capacity is full
+                            self.rsi_drops[symbol] = None
+                            return
 
                         stop_loss = current_price * (1 - c['stop_loss_pct'])
                         take_profit = current_price * (1 + c['take_profit_pct'])
