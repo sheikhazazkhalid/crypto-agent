@@ -21,10 +21,6 @@ CONFIG = {
     'poll_interval': 30,              # Seconds between each data fetch / cycle
     'dry_run': True,                  # True = no real trades, for safe testing
 
-    # ==== Telegram (fill these) ====
-    'telegram_token': '',             # e.g. '123456:ABC-DEF...'
-    'telegram_chat_id': '',           # e.g. '-1001234567890' or '123456789'
-
     # ==== Discord (fill this) ====
     'discord_webhook': 'https://discord.com/api/webhooks/1430967851421798611/Lz1C4uPNljUJIWpOL5LDjI3FjnraGhBCrCa4omTSWJ8U-LYYN_0Ve8TEXSVdy30EJmI0',
     'discord_username': 'Azaz#8117',  # Optional custom username for webhook messages
@@ -49,12 +45,29 @@ CONFIG = {
     'ema_slow_span': 26,
     'macd_signal_span': 9,
     'rsi_period': 14,
-    'rsi_buy_threshold': 30,          # RSI drop threshold (watch)
+    'rsi_buy_threshold': 25,          # RSI drop threshold (watch)
     'ema_200_span': 200,              # 200 EMA filter
     'cross_lookback': 8,              # how many past bars to scan for MACD cross after RSI drop
 
     # volume
     'volume_avg_window': 20,
+
+    # --- NEW: higher-timeframe trend filter ---
+    'use_htf_trend': True,        # True = use a separate timeframe for the EMA200 trend check
+    'trend_timeframe': '15m',     # e.g., '15m', '1h', '4h'
+    'trend_limit': 300,           # candles to fetch for trend timeframe
+    'trend_ema_span': 200,        # EMA span to use on the trend timeframe (usually 200)
+    # --- END NEW ---
+
+    # --- NEW: BTC crash filter to block watcher creation ---
+    'crash_filter_enabled': True,         # block watcher creation during BTC crash
+    'crash_symbol': 'BTC/USDT',           # reference symbol for market risk
+    'crash_timeframe': None,              # None = use CONFIG['timeframe'], or set like '5m','15m'
+    'crash_lookback_bars': 3,             # bars to measure % drop
+    'crash_pct_drop_threshold': 1.5,      # % drop over lookback to flag a crash
+    'crash_rsi_threshold': 30,            # RSI at/under => crash
+    'crash_cache_ttl_sec': 20,            # cache BTC risk result for this many seconds
+    # --- END NEW ---
 
     # max concurrent open positions (<=0 means unlimited)
     'max_open_positions': 0,
@@ -88,6 +101,10 @@ class MultiPairBot:
         self.positions = {symbol: None for symbol in cfg['symbols']}
         # explicitly track RSI-drop watchers per symbol
         self.rsi_drops = {symbol: None for symbol in cfg['symbols']}
+        # NEW: optional simple trend cache placeholder (not strictly used below, but kept for future improvements)
+        self.trend_cache = {}
+        # NEW: cache for BTC crash check
+        self._crash_cache = {'ts': 0, 'result': (False, '')}
         # register exit handler to notify on normal exit
         try:
             atexit.register(self.on_exit)
@@ -362,6 +379,17 @@ class MultiPairBot:
 
         # New entry flow only
         if not pos:
+            # --- NEW: if BTC is crashing, clear existing watcher and skip any new watcher/entry ---
+            if self.cfg.get('crash_filter_enabled', True) and symbol != self.cfg.get('crash_symbol', 'BTC/USDT'):
+                crashing, reason = self.is_btc_crashing()
+                if crashing:
+                    if self.rsi_drops.get(symbol) is not None:
+                        print(f"🛑 {symbol}: BTC crash detected ({reason}) — clearing existing watcher")
+                        self.rsi_drops[symbol] = None
+                    # Also skip creating/processing watcher this cycle
+                    return
+            # --- END NEW ---
+
             # 1) Record RSI drop -> start watcher
             rsi_val = None
             try:
@@ -380,17 +408,23 @@ class MultiPairBot:
                         prev_rsi = None
 
                 if rsi_val < buy_th and (prev_rsi is None or prev_rsi >= buy_th):
+                    # --- NEW: block watcher if BTC is crashing ---
+                    if c.get('crash_filter_enabled', True) and symbol != c.get('crash_symbol', 'BTC/USDT'):
+                        crashing, reason = self.is_btc_crashing()
+                        if crashing:
+                            print(f"🛑 {symbol}: Skipping watcher due to BTC crash ({reason})")
+                            return  # do not add watcher during market crash
+                    # --- END NEW ---
+
                     if getattr(self, 'rsi_drops', None) is None:
                         self.rsi_drops = {s: None for s in c['symbols']}
                     if self.rsi_drops.get(symbol) is None:
-                        # prefer indexed candle timestamp if available
                         try:
                             watch_time = df.index[-1]
                         except Exception:
                             watch_time = latest.get('time') or pd.Timestamp.now()
                         self.rsi_drops[symbol] = watch_time
                         print(f"🔎 {symbol}: RSI crossed below {buy_th} ({rsi_val:.2f}) — watching for MACD bullish cross")
-                # NOTE: do NOT clear watcher on RSI recovery here — keep watching until a MACD cross is processed
             # 2) If watching, search for MACD bullish cross after recorded RSI-drop time
             watch_time = getattr(self, 'rsi_drops', {}).get(symbol)
             if watch_time is not None:
@@ -407,9 +441,18 @@ class MultiPairBot:
                         print(f"⛔ {symbol}: MACD cross found at {macd_cross_time} but MACD not bullish at latest bar — skipping buy for this cross (will watch for next cross)")
                         return  # keep watcher active (advanced), wait for next cross
 
-                    # 3) Confirm trend: price above 200 EMA
-                    ema200 = latest.get('EMA_200', np.nan)
-                    if not np.isnan(ema200) and current_price > float(ema200):
+                    # --- NEW: Higher-timeframe EMA200 trend filter (optional) ---
+                    use_htf = bool(c.get('use_htf_trend', False) and c.get('trend_timeframe'))
+                    if use_htf:
+                        ema200_val, ema200_time = self.get_htf_ema200(symbol)
+                        ema_label = f"EMA200[{c.get('trend_timeframe')}]"
+                    else:
+                        ema200_val = latest.get('EMA_200', np.nan)
+                        ema_label = "EMA200[current tf]"
+                    # --- END NEW ---
+
+                    # 3) Confirm trend: price above EMA200 (HTF or current tf)
+                    if not np.isnan(ema200_val) and current_price > float(ema200_val):
                         # Optional volume confirmation
                         if c.get('enable_volume_confirmation', False):
                             try:
@@ -418,7 +461,6 @@ class MultiPairBot:
                                 cur_vol = np.nan
                             vavg = latest.get('vol_avg', np.nan)
                             if np.isnan(vavg):
-                                # fallback compute if vol_avg disabled or not ready
                                 try:
                                     vavg = float(df['volume'].rolling(window=c.get('volume_avg_window', 20)).mean().iloc[-1])
                                 except Exception:
@@ -426,10 +468,10 @@ class MultiPairBot:
                             multiplier = float(c.get('volume_confirm_multiplier', 1.0))
                             vol_ok = (not np.isnan(cur_vol)) and (not np.isnan(vavg)) and (cur_vol >= multiplier * vavg)
                             if not vol_ok:
-                                print(f"⛔ {symbol}: Volume confirmation failed at cross — vol {fmt(cur_vol)} < {multiplier}× vavg {fmt(vavg)} (skipping buy for this cross)")
-                                # Clear watcher on volume confirmation failure
+                                print(f"⛔ {symbol}: Volume confirmation failed at cross — vol {cur_vol if not np.isnan(cur_vol) else 'n/a'} < {multiplier}× vavg {vavg if not np.isnan(vavg) else 'n/a'} (skipping buy; clearing watcher)")
+                                # Clear watcher on volume confirmation failure and STOP processing this entry
                                 self.rsi_drops[symbol] = None
-
+                                return
                         # enforce max open positions limit
                         if not self.can_open_new_trade():
                             print(f"⛔ {symbol}: max open positions reached ({self.get_open_positions_count()}/{c.get('max_open_positions')}) - skipping buy and clearing watcher")
@@ -450,7 +492,7 @@ class MultiPairBot:
                             'trade_id': trade_id
                         }
 
-                        reason = "RSI_DROP+MACD_CROSS+EMA200"
+                        reason = f"RSI_DROP+MACD_CROSS+{ema_label}"
                         print(f"✅ {symbol}: BUY @ {current_price:.4f} | SL {stop_loss:.4f} | TP {take_profit:.4f} | REASON: {reason}")
 
                         # send detailed alert (includes SL/TP) after position is recorded
@@ -462,8 +504,9 @@ class MultiPairBot:
                         # clear watcher on successful buy
                         self.rsi_drops[symbol] = None
                     else:
-                       print(f"⛔ {symbol}: MACD crossed at {macd_cross_time} after RSI drop but EMA200 filter failed ({current_price:.4f} <= {ema200 if not np.isnan(ema200) else 'n/a'}) — clearing watcher for this RSI-drop")
-                       self.rsi_drops[symbol] = None
+                        print(f"⛔ {symbol}: MACD crossed at {macd_cross_time} after RSI drop but {ema_label} filter failed "
+                              f"({current_price:.4f} <= {ema200_val if not np.isnan(ema200_val) else 'n/a'}) — clearing watcher")
+                        self.rsi_drops[symbol] = None
                 # else: keep waiting
 
     def summarize_performance(self):
@@ -558,14 +601,27 @@ class MultiPairBot:
     # --- end new helpers ---
 
     def find_bullish_macd_cross_time(self, df, lookback=None, after_time=None):
-        """Scan the last `lookback` closed candles for the FIRST MACD crossing above Signal AFTER `after_time`.
-        Return timestamp of the first qualifying cross candle (pd.Timestamp) or None.
+        """Scan for the FIRST MACD crossing above Signal AFTER `after_time`.
+        If `after_time` is provided, search from that timestamp forward (no fixed lookback).
+        Otherwise, search the last `lookback` bars. Return pd.Timestamp or None.
         """
-        if lookback is None:
-            lookback = int(self.cfg.get('cross_lookback', 8))
         if len(df) < 2:
             return None
-        start = max(1, len(df) - lookback)
+
+        # Compute the start index
+        if after_time is not None:
+            try:
+                after_ts = pd.to_datetime(after_time)
+                # find the first index strictly after the recorded time
+                pos = df.index.searchsorted(after_ts, side='right')
+                start = max(1, int(pos))  # ensure we have a previous bar at i-1
+            except Exception:
+                start = 1
+        else:
+            if lookback is None:
+                lookback = int(self.cfg.get('cross_lookback', 8))
+            start = max(1, len(df) - lookback)
+
         for i in range(start, len(df)):
             try:
                 prev = df.iloc[i - 1]
@@ -574,7 +630,7 @@ class MultiPairBot:
                 if cross_happened:
                     cross_time = cur.get('time') or cur.name
                     if after_time is None or pd.to_datetime(cross_time) > pd.to_datetime(after_time):
-                        return cross_time  # return the FIRST one after after_time
+                        return cross_time
             except Exception:
                 continue
         return None
@@ -590,6 +646,99 @@ class MultiPairBot:
             return True  # unlimited
         return self.get_open_positions_count() < maxp
 
+    def get_htf_ema200(self, symbol):
+        """
+        NEW: Fetch higher-timeframe EMA200 for trend filtering (if enabled).
+        Returns the EMA200 value and the timestamp of the EMA bar.
+        """
+        c = self.cfg
+        timeframe = c.get('trend_timeframe', '15m')
+        limit = c.get('trend_limit', 300)
+        try:
+            ohlcv = self.data_client.fetch_ohlcv(symbol, timeframe, limit=limit)
+            df_htf = pd.DataFrame(ohlcv, columns=['time','open','high','low','close','volume'])
+            df_htf['time'] = pd.to_datetime(df_htf['time'], unit='ms')
+            df_htf.set_index('time', inplace=True)
+
+            # EMA200 on the higher timeframe
+            ema200_htf = df_htf['close'].ewm(span=200, adjust=False).mean()
+            df_htf['EMA_200'] = ema200_htf
+
+            # latest EMA200 value and corresponding time
+            latest_ema200 = df_htf.iloc[-1]
+            ema200_val = latest_ema200['EMA_200']
+            ema200_time = latest_ema200.name
+
+            return ema200_val, ema200_time
+        except Exception as e:
+            print(f"[HTF EMA200 fetch error] {symbol} ({timeframe}): {e}")
+            return np.nan, None
+
+    def is_btc_crashing(self):
+        """
+        Return (is_crash: bool, reason: str).
+        Crash if either:
+          - BTC % change over crash_lookback_bars <= -crash_pct_drop_threshold
+          - BTC RSI <= crash_rsi_threshold
+        Cached for crash_cache_ttl_sec to avoid repeated fetches per loop.
+        """
+        c = self.cfg
+        if not c.get('crash_filter_enabled', True):
+            return (False, '')
+
+        now = time.time()
+        ttl = int(c.get('crash_cache_ttl_sec', max(5, int(c.get('poll_interval', 30)))))
+        if self._crash_cache and (now - self._crash_cache['ts'] <= ttl):
+            return self._crash_cache['result']
+
+        sym = c.get('crash_symbol', 'BTC/USDT')
+        tf = c.get('crash_timeframe') or c.get('timeframe', '5m')
+        lookback = max(1, int(c.get('crash_lookback_bars', 3)))
+        pct_th = float(c.get('crash_pct_drop_threshold', 1.5))
+        rsi_th = float(c.get('crash_rsi_threshold', 20.0))
+
+        try:
+            # fetch enough bars for RSI and lookback
+            limit = max(c.get('limit', 300), 50)
+            ohlcv = self.data_client.fetch_ohlcv(sym, tf, limit=limit)
+            df_btc = pd.DataFrame(ohlcv, columns=['time','open','high','low','close','volume'])
+            df_btc['time'] = pd.to_datetime(df_btc['time'], unit='ms')
+            df_btc.set_index('time', inplace=True)
+
+            # RSI on BTC
+            btc_rsi = float(self.compute_rsi(df_btc['close'], c.get('rsi_period', 14)).iloc[-1])
+
+            # % change over lookback bars
+            if len(df_btc) <= lookback:
+                result = (False, 'insufficient_bars')
+            else:
+                c_now = float(df_btc['close'].iloc[-1])
+                c_prev = float(df_btc['close'].iloc[-1 - lookback])
+                pct_change = (c_now - c_prev) / c_prev * 100.0
+
+                crash_rsi = btc_rsi <= rsi_th
+                crash_drop = pct_change <= -pct_th
+
+                if crash_drop or crash_rsi:
+                    reason = []
+                    if crash_drop:
+                        reason.append(f"drop {pct_change:.2f}% ≤ -{pct_th:.2f}%/{lookback}b")
+                    if crash_rsi:
+                        reason.append(f"RSI {btc_rsi:.1f} ≤ {rsi_th:.1f}")
+                    result = (True, "; ".join(reason))
+                else:
+                    result = (False, f"drop {pct_change:.2f}% and RSI {btc_rsi:.1f}")
+
+            self._crash_cache = {'ts': now, 'result': result}
+            return result
+        except Exception as e:
+            # On failure, do not block entries; log reason
+            print(f"[BTC crash check error] {sym} {tf}: {e}")
+            result = (False, 'check_failed')
+            self._crash_cache = {'ts': now, 'result': result}
+            return result
+        
+        
 if __name__ == '__main__':
     bot = MultiPairBot(CONFIG)
     bot.run()
