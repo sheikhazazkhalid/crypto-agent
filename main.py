@@ -10,16 +10,31 @@ import json
 import traceback
 import atexit
 import sys
+from datetime import timedelta
+try:
+    from zoneinfo import ZoneInfo
+    PK_TZ = ZoneInfo("Asia/Karachi")
+except Exception:
+    PK_TZ = timezone(timedelta(hours=5))  # fallback if zoneinfo not available
+
+def now_pk():
+    try:
+        return datetime.now(PK_TZ)
+    except Exception:
+        return datetime.utcnow() + timedelta(hours=5)
+
+def ts_pk():
+    return now_pk().strftime('%Y-%m-%d %H:%M:%S')
 
 CONFIG = {
     # ==== Exchange / General ====
-    'api_key': '',                    # Binance/Bybit API key (optional for dry-run)
-    'api_secret': '',                 # Binance/Bybit API secret (optional for dry-run)
+    'api_key': '',
+    'api_secret': '',
     'symbols': ['BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'XRP/USDT', 'SOL/USDT', 'ADA/USDT', 'LINK/USDT', 'AVAX/USDT', 'POL/USDT', 'LTC/USDT', 'DOT/USDT', 'ATOM/USDT'],
-    'timeframe': '5m',                # Candle interval: 5m gives smoother signals than 1m
-    'limit': 300,                     # Number of candles to fetch (for indicators)
-    'poll_interval': 30,              # Seconds between each data fetch / cycle
-    'dry_run': True,                  # True = no real trades, for safe testing
+    'timeframe': '5m',
+    'limit': 300,
+    'poll_interval': 30,
+    'dry_run': True,
 
     # ==== Discord (fill this) ====
     'discord_webhook': 'https://discord.com/api/webhooks/1430967851421798611/Lz1C4uPNljUJIWpOL5LDjI3FjnraGhBCrCa4omTSWJ8U-LYYN_0Ve8TEXSVdy30EJmI0',
@@ -59,16 +74,7 @@ CONFIG = {
     'trend_ema_span': 200,        # EMA span to use on the trend timeframe (usually 200)
     # --- END NEW ---
 
-    # --- NEW: BTC crash filter to block watcher creation ---
-    'crash_filter_enabled': True,         # block watcher creation during BTC crash
-    'crash_symbol': 'BTC/USDT',           # reference symbol for market risk
-    'crash_timeframe': None,              # None = use CONFIG['timeframe'], or set like '5m','15m'
-    'crash_lookback_bars': 3,             # bars to measure % drop
-    'crash_pct_drop_threshold': 1.5,      # % drop over lookback to flag a crash
-    'crash_rsi_threshold': 30,            # RSI at/under => crash
-    'crash_cache_ttl_sec': 20,            # cache BTC risk result for this many seconds
-    # --- END NEW ---
-
+   
     # max concurrent open positions (<=0 means unlimited)
     'max_open_positions': 0,
 
@@ -99,12 +105,9 @@ class MultiPairBot:
         self.conn = sqlite3.connect('trades.db', check_same_thread=False)
         self.create_tables()
         self.positions = {symbol: None for symbol in cfg['symbols']}
-        # explicitly track RSI-drop watchers per symbol
         self.rsi_drops = {symbol: None for symbol in cfg['symbols']}
-        # NEW: optional simple trend cache placeholder (not strictly used below, but kept for future improvements)
         self.trend_cache = {}
-        # NEW: cache for BTC crash check
-        self._crash_cache = {'ts': 0, 'result': (False, '')}
+        # REMOVE: self._crash_cache = {'ts': 0, 'result': (False, '')}
         # register exit handler to notify on normal exit
         try:
             atexit.register(self.on_exit)
@@ -267,7 +270,7 @@ class MultiPairBot:
         return {'USDT': usdt}
 
     def place_order(self, symbol, side, amount, price, notify=True):
-        timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+        timestamp = ts_pk()
         order_type = self.cfg.get('order_type', 'market')
         if self.cfg['dry_run']:
             msg = f"[DRY RUN] {timestamp} | {symbol} | {side.upper()} {amount:.8f} @ {price:.8f} ({order_type})"
@@ -332,8 +335,7 @@ class MultiPairBot:
 
         msg = f"💰 {symbol}: Trade closed | P/L {pnl:.4f} USDT"
         print(msg)
-        # telegram + discord alert on close
-        self.send_alerts(f"🔴 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} | {msg}")
+        self.send_alerts(f"🔴 {ts_pk()} | {msg}")
         self.positions[symbol] = None
 
 
@@ -359,7 +361,7 @@ class MultiPairBot:
             except Exception:
                 return "n/a"
 
-        print(f"\n[{symbol}] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"\n[{symbol}] {ts_pk()}")
         print(
             f"Price: {current_price:.4f} | RSI: {fmt(latest.get('RSI'))} | MACD: {fmt(latest.get('MACD'),6)} | "
             f"Signal: {fmt(latest.get('Signal'),6)} | EMA200: {fmt(latest.get('EMA_200'))} | "
@@ -379,17 +381,7 @@ class MultiPairBot:
 
         # New entry flow only
         if not pos:
-            # --- NEW: if BTC is crashing, clear existing watcher and skip any new watcher/entry ---
-            if self.cfg.get('crash_filter_enabled', True) and symbol != self.cfg.get('crash_symbol', 'BTC/USDT'):
-                crashing, reason = self.is_btc_crashing()
-                if crashing:
-                    if self.rsi_drops.get(symbol) is not None:
-                        print(f"🛑 {symbol}: BTC crash detected ({reason}) — clearing existing watcher")
-                        self.rsi_drops[symbol] = None
-                    # Also skip creating/processing watcher this cycle
-                    return
-            # --- END NEW ---
-
+            # REMOVE: BTC crash pre-check that cleared watcher and returned
             # 1) Record RSI drop -> start watcher
             rsi_val = None
             try:
@@ -398,7 +390,6 @@ class MultiPairBot:
                 pass
 
             if rsi_val is not None:
-                # require an actual CROSS down into the buy zone: previous RSI must be >= threshold
                 buy_th = float(c.get('rsi_buy_threshold', 30))
                 prev_rsi = None
                 if len(df) >= 2:
@@ -408,14 +399,7 @@ class MultiPairBot:
                         prev_rsi = None
 
                 if rsi_val < buy_th and (prev_rsi is None or prev_rsi >= buy_th):
-                    # --- NEW: block watcher if BTC is crashing ---
-                    if c.get('crash_filter_enabled', True) and symbol != c.get('crash_symbol', 'BTC/USDT'):
-                        crashing, reason = self.is_btc_crashing()
-                        if crashing:
-                            print(f"🛑 {symbol}: Skipping watcher due to BTC crash ({reason})")
-                            return  # do not add watcher during market crash
-                    # --- END NEW ---
-
+                    # REMOVE: per-symbol BTC crash gate before adding watcher
                     if getattr(self, 'rsi_drops', None) is None:
                         self.rsi_drops = {s: None for s in c['symbols']}
                     if self.rsi_drops.get(symbol) is None:
@@ -496,7 +480,7 @@ class MultiPairBot:
                         print(f"✅ {symbol}: BUY @ {current_price:.4f} | SL {stop_loss:.4f} | TP {take_profit:.4f} | REASON: {reason}")
 
                         # send detailed alert (includes SL/TP) after position is recorded
-                        timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+                        timestamp = ts_pk()
                         alert_msg = (f"🟢 {timestamp} | {symbol} | BUY {trade_amount:.8f} @ {current_price:.8f} "
                                      f"| SL {stop_loss:.8f} | TP {take_profit:.8f} | REASON: {reason}")
                         self.send_alerts(alert_msg)
@@ -518,7 +502,7 @@ class MultiPairBot:
     def on_exit(self):
         """Attempt to notify Discord/Telegram that the bot is stopping."""
         try:
-            msg = f"🛑 Bot stopped: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}"
+            msg = f"🛑 Bot stopped: {ts_pk()}"
             self.send_alerts(msg)
             # small delay to allow network I/O to complete when possible
             time.sleep(0.5)
@@ -563,7 +547,7 @@ class MultiPairBot:
         finally:
             # ensure a final shutdown alert (also handled by atexit)
             try:
-                self.send_alerts(f"🟥 Bot exiting: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}")
+                self.send_alerts(f"🟥 Bot exiting: {ts_pk()}")
                 time.sleep(0.5)
             except Exception:
                 pass
@@ -674,71 +658,7 @@ class MultiPairBot:
             print(f"[HTF EMA200 fetch error] {symbol} ({timeframe}): {e}")
             return np.nan, None
 
-    def is_btc_crashing(self):
-        """
-        Return (is_crash: bool, reason: str).
-        Crash if either:
-          - BTC % change over crash_lookback_bars <= -crash_pct_drop_threshold
-          - BTC RSI <= crash_rsi_threshold
-        Cached for crash_cache_ttl_sec to avoid repeated fetches per loop.
-        """
-        c = self.cfg
-        if not c.get('crash_filter_enabled', True):
-            return (False, '')
 
-        now = time.time()
-        ttl = int(c.get('crash_cache_ttl_sec', max(5, int(c.get('poll_interval', 30)))))
-        if self._crash_cache and (now - self._crash_cache['ts'] <= ttl):
-            return self._crash_cache['result']
-
-        sym = c.get('crash_symbol', 'BTC/USDT')
-        tf = c.get('crash_timeframe') or c.get('timeframe', '5m')
-        lookback = max(1, int(c.get('crash_lookback_bars', 3)))
-        pct_th = float(c.get('crash_pct_drop_threshold', 1.5))
-        rsi_th = float(c.get('crash_rsi_threshold', 20.0))
-
-        try:
-            # fetch enough bars for RSI and lookback
-            limit = max(c.get('limit', 300), 50)
-            ohlcv = self.data_client.fetch_ohlcv(sym, tf, limit=limit)
-            df_btc = pd.DataFrame(ohlcv, columns=['time','open','high','low','close','volume'])
-            df_btc['time'] = pd.to_datetime(df_btc['time'], unit='ms')
-            df_btc.set_index('time', inplace=True)
-
-            # RSI on BTC
-            btc_rsi = float(self.compute_rsi(df_btc['close'], c.get('rsi_period', 14)).iloc[-1])
-
-            # % change over lookback bars
-            if len(df_btc) <= lookback:
-                result = (False, 'insufficient_bars')
-            else:
-                c_now = float(df_btc['close'].iloc[-1])
-                c_prev = float(df_btc['close'].iloc[-1 - lookback])
-                pct_change = (c_now - c_prev) / c_prev * 100.0
-
-                crash_rsi = btc_rsi <= rsi_th
-                crash_drop = pct_change <= -pct_th
-
-                if crash_drop or crash_rsi:
-                    reason = []
-                    if crash_drop:
-                        reason.append(f"drop {pct_change:.2f}% ≤ -{pct_th:.2f}%/{lookback}b")
-                    if crash_rsi:
-                        reason.append(f"RSI {btc_rsi:.1f} ≤ {rsi_th:.1f}")
-                    result = (True, "; ".join(reason))
-                else:
-                    result = (False, f"drop {pct_change:.2f}% and RSI {btc_rsi:.1f}")
-
-            self._crash_cache = {'ts': now, 'result': result}
-            return result
-        except Exception as e:
-            # On failure, do not block entries; log reason
-            print(f"[BTC crash check error] {sym} {tf}: {e}")
-            result = (False, 'check_failed')
-            self._crash_cache = {'ts': now, 'result': result}
-            return result
-        
-        
 if __name__ == '__main__':
     bot = MultiPairBot(CONFIG)
     bot.run()
