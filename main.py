@@ -477,6 +477,7 @@ class MultiPairBot:
                             decision = self.call_gemini_for_trade_decision(analysis)
                             if decision != 'YES':
                                 print(f"⛔ {symbol}: Gemini decision = {decision}. Skipping buy and clearing watcher.")
+                                self.send_alerts(f"⛔ {symbol}: Gemini decision = {decision}. Buy skipped.")
                                 self.rsi_drops[symbol] = None
                                 return
                         # === END NEW ===
