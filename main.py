@@ -1,3 +1,4 @@
+import os
 import ccxt
 import pandas as pd
 import numpy as np
@@ -10,6 +11,8 @@ import json
 import traceback
 import atexit
 import sys
+import re
+from dotenv import load_dotenv
 from datetime import timedelta
 try:
     from zoneinfo import ZoneInfo
@@ -83,8 +86,13 @@ CONFIG = {
     'limit_price_buffer_pct': 0.001,  # 0.1% buffer for limit orders (above for buy, below for sell)
     'exchange_for_data': 'mexc',  
     'exchange_for_trading': 'binance', # 'binance' for global trading (your account), 'binanceus' for US
-}
 
+    # === NEW: Gemini decision gate ===
+    'enable_gemini_filter': True,          # if True, require Gemini to answer "Yes" to buy
+    'gemini_api_key': '',                   # set your Gemini API key here
+    'gemini_model': 'gemini-2.5-flash-lite',     # model name
+    'gemini_timeout': 10,                   # seconds
+}
 
 
 class MultiPairBot:
@@ -463,6 +471,16 @@ class MultiPairBot:
                             self.rsi_drops[symbol] = None
                             return
 
+                        # === NEW: Gemini Yes/No gate ===
+                        if c.get('enable_gemini_filter', False):
+                            analysis = self.analyze_market(symbol, df)
+                            decision = self.call_gemini_for_trade_decision(analysis)
+                            if decision != 'YES':
+                                print(f"⛔ {symbol}: Gemini decision = {decision}. Skipping buy and clearing watcher.")
+                                self.rsi_drops[symbol] = None
+                                return
+                        # === END NEW ===
+                        
                         stop_loss = current_price * (1 - c['stop_loss_pct'])
                         take_profit = current_price * (1 + c['take_profit_pct'])
                         order = self.place_order(symbol, 'buy', trade_amount, current_price, notify=False)
@@ -658,7 +676,277 @@ class MultiPairBot:
             print(f"[HTF EMA200 fetch error] {symbol} ({timeframe}): {e}")
             return np.nan, None
 
+    # === NEW: Market analysis (5m/15m/1h/4h) ===
+    def analyze_market(self, symbol: str, df_5m: pd.DataFrame = None) -> dict:
+        """
+        Returns a dict like:
+        {
+          'symbol': 'ADA/USDT',
+          'current_price': 0.6559,
+          'general_bias_1h': 'BULLISH',
+          'recent_support': 0.6466,
+          'recent_resistance': 0.6596,
+          'volume_ratio': 1.8,
+          'volume_bias': 'HIGH',
+          'volatility_ratio': 1.4,
+          'volatility_bias': 'NORMAL',
+          'trend_1h': 'BULLISH',
+          'trend_4h': 'BULLISH'
+        }
+        """
+        c = self.cfg
+        out = {
+            'symbol': symbol,
+            'current_price': None,
+            'general_bias_1h': None,
+            'recent_support': None,
+            'recent_resistance': None,
+            'volume_ratio': None,
+            'volume_bias': None,
+            'volatility_ratio': None,
+            'volatility_bias': None,
+            'trend_1h': None,
+            'trend_4h': None,
+        }
+
+        # Current price from real-time ticker
+        try:
+            tkr = self.data_client.fetch_ticker(symbol)
+            out['current_price'] = float(tkr.get('last') or tkr.get('close') or tkr.get('ask') or tkr.get('bid'))
+        except Exception:
+            pass
+
+        # Ensure 5m df
+        try:
+            if df_5m is None:
+                ohlcv = self.data_client.fetch_ohlcv(symbol, '5m', limit=max(100, c.get('limit', 300)))
+                df_5m = pd.DataFrame(ohlcv, columns=['time','open','high','low','close','volume'])
+                df_5m['time'] = pd.to_datetime(df_5m['time'], unit='ms')
+                df_5m.set_index('time', inplace=True)
+        except Exception:
+            df_5m = None
+
+        # General bias over last 12 x 5m candles (≈1h): close(now) vs open(12 bars ago)
+        try:
+            if df_5m is not None and len(df_5m) >= 12:
+                close_now = float(df_5m['close'].iloc[-1])
+                open_12_ago = float(df_5m['open'].iloc[-12])
+                if close_now > open_12_ago:
+                    out['general_bias_1h'] = 'BULLISH'
+                elif close_now < open_12_ago:
+                    out['general_bias_1h'] = 'BEARISH'
+                else:
+                    out['general_bias_1h'] = 'NEUTRAL'
+        except Exception:
+            pass
+
+        # Volume comparison: current 5m volume vs avg of previous 11 5m
+        try:
+            if df_5m is not None and len(df_5m) >= 12:
+                cur_vol = float(df_5m['volume'].iloc[-1])
+                prev_avg = float(df_5m['volume'].iloc[-12:-1].mean())
+                if prev_avg > 0:
+                    vr = cur_vol / prev_avg
+                    out['volume_ratio'] = vr
+                    out['volume_bias'] = 'HIGH' if vr >= 1.2 else ('LOW' if vr <= 0.8 else 'NORMAL')
+        except Exception:
+            pass
+
+        # Volatility: current 5m range vs avg range of previous 11 bars
+        try:
+            if df_5m is not None and len(df_5m) >= 12:
+                cur_range = float(df_5m['high'].iloc[-1] - df_5m['low'].iloc[-1])
+                prev_ranges = (df_5m['high'] - df_5m['low']).iloc[-12:-1]
+                avg_prev_range = float(prev_ranges.mean())
+                if avg_prev_range > 0:
+                    vlt = cur_range / avg_prev_range
+                    out['volatility_ratio'] = vlt
+                    out['volatility_bias'] = 'HIGH' if vlt >= 1.5 else ('LOW' if vlt <= 0.7 else 'NORMAL')
+        except Exception:
+            pass
+
+        # Support/Resistance using recent pivots on 5m and 15m
+        try:
+            sup5, res5, ts5 = self._recent_pivots(df_5m) if df_5m is not None else (None, None, None)
+        except Exception:
+            sup5, res5, ts5 = (None, None, None)
+        try:
+            ohlcv15 = self.data_client.fetch_ohlcv(symbol, '15m', limit=200)
+            df_15m = pd.DataFrame(ohlcv15, columns=['time','open','high','low','close','volume'])
+            df_15m['time'] = pd.to_datetime(df_15m['time'], unit='ms')
+            df_15m.set_index('time', inplace=True)
+            sup15, res15, ts15 = self._recent_pivots(df_15m)
+        except Exception:
+            sup15, res15, ts15 = (None, None, None)
+
+        # choose most recent levels among 5m and 15m
+        sup_choice = (sup5, ts5) if ts5 is not None else (None, None)
+        if ts15 is not None and (sup_choice[1] is None or ts15 > sup_choice[1]):
+            sup_choice = (sup15, ts15)
+        res_choice = (res5, ts5) if ts5 is not None else (None, None)
+        if ts15 is not None and (res_choice[1] is None or ts15 > res_choice[1]):
+            res_choice = (res15, ts15)
+
+        out['recent_support'] = float(sup_choice[0]) if sup_choice[0] is not None else None
+        out['recent_resistance'] = float(res_choice[0]) if res_choice[0] is not None else None
+
+        # Higher timeframe trends via EMA(200) on 1h and 4h
+        try:
+            out['trend_1h'] = self._ema_trend(symbol, '1h', span=200)
+        except Exception:
+            pass
+        try:
+            out['trend_4h'] = self._ema_trend(symbol, '4h', span=200)
+        except Exception:
+            pass
+
+        return out
+
+    def _recent_pivots(self, df: pd.DataFrame, left: int = 2, right: int = 2):
+        """
+        Return (support, resistance, timestamp_of_these_pivots) using most recent pivots.
+        Pivot high: local max over window [i-left, i+right]; pivot low: local min similarly.
+        """
+        if df is None or len(df) < left + right + 3:
+            return (None, None, None)
+
+        highs = df['high'].values
+        lows = df['low'].values
+        idx = df.index
+
+        pivot_high_idx = None
+        pivot_low_idx = None
+
+        # scan from newest backwards to find most recent
+        for i in range(len(df) - right - 1, left - 1, -1):
+            h_win = highs[i - left: i + right + 1]
+            l_win = lows[i - left: i + right + 1]
+            if pivot_high_idx is None and highs[i] == h_win.max():
+                pivot_high_idx = i
+            if pivot_low_idx is None and lows[i] == l_win.min():
+                pivot_low_idx = i
+            if pivot_high_idx is not None and pivot_low_idx is not None:
+                break
+
+        sup = float(lows[pivot_low_idx]) if pivot_low_idx is not None else None
+        res = float(highs[pivot_high_idx]) if pivot_high_idx is not None else None
+
+        # timestamp preference: latest among found pivots
+        ts_candidates = []
+        if pivot_high_idx is not None:
+            ts_candidates.append(idx[pivot_high_idx])
+        if pivot_low_idx is not None:
+            ts_candidates.append(idx[pivot_low_idx])
+        ts = max(ts_candidates) if ts_candidates else None
+
+        return (sup, res, ts)
+
+    def _ema_trend(self, symbol: str, timeframe: str, span: int = 200, limit: int = 300) -> str:
+        ohlcv = self.data_client.fetch_ohlcv(symbol, timeframe, limit=max(limit, span + 10))
+        df = pd.DataFrame(ohlcv, columns=['time','open','high','low','close','volume'])
+        df['time'] = pd.to_datetime(df['time'], unit='ms')
+        df.set_index('time', inplace=True)
+        ema = df['close'].ewm(span=span, adjust=False).mean()
+        if len(df) == 0:
+            return None
+        return 'BULLISH' if float(df['close'].iloc[-1]) > float(ema.iloc[-1]) else 'BEARISH'
+
+    # === NEW: Gemini call and decision ===
+    def call_gemini_for_trade_decision(self, analysis: dict) -> str:
+        """
+        Build a concise prompt from available fields, ask Gemini to respond only 'Yes' or 'No'.
+        Returns 'YES' or 'NO' (uppercase). Defaults to 'NO' on errors/ambiguity.
+        """
+        if not self.cfg.get('enable_gemini_filter', False):
+            return 'YES'  # if filter disabled, do not block
+
+        api_key = (self.cfg.get('gemini_api_key') or os.getenv('GEMINI_API_KEY')).strip()
+        if not api_key:
+            print("⚠️  Gemini filter enabled but gemini_api_key not set — skipping trade (NO).")
+            return 'NO'
+
+        # Build data block with only available fields
+        data_lines = []
+        for k in ['symbol','current_price','general_bias_1h','recent_support','recent_resistance',
+                  'volume_ratio','volume_bias','volatility_ratio','volatility_bias','trend_1h','trend_4h']:
+            v = analysis.get(k, None)
+            if v is not None:
+                data_lines.append(f"'{k}': {repr(v) if not isinstance(v, (float,int)) else v}")
+
+        data_block = "{\n  " + ",\n  ".join(data_lines) + "\n}"
+
+        prompt = (
+            "Analyze the following trading data and decide if a high-probability breakout LONG is advisable.\n\n"
+            f"Data:\n{data_block}\n\n"
+            "Respond with only one word: Yes or No."
+        )
+
+        model = self.cfg.get('gemini_model', 'gemini-2.5-flash-lite')
+        timeout = int(self.cfg.get('gemini_timeout', 10))
+
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={urllib.parse.quote(api_key)}"
+            body = {
+                "contents": [
+                    {"parts": [{"text": prompt}]}
+                ]
+            }
+            data = json.dumps(body).encode()
+            headers = {
+                "Content-Type": "application/json",
+                "User-Agent": "crypto-agent/1.0"
+            }
+            req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode()
+            parsed = json.loads(raw)
+
+            # Try to extract the first text response
+            text = ""
+            try:
+                candidates = parsed.get('candidates', [])
+                if candidates:
+                    parts = candidates[0].get('content', {}).get('parts', [])
+                    if parts:
+                        text = parts[0].get('text', '')
+            except Exception:
+                text = ""
+
+            decision = self._parse_yes_no(text)
+            print(f"🤖 Gemini decision for {analysis.get('symbol')}: {decision} | raw='{text.strip()[:80]}'")
+            return decision
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read().decode(errors='ignore')
+            except Exception:
+                body = '<no body>'
+            print(f"[Gemini HTTPError] code={e.code} reason={e.reason} body={body[:200]}")
+            return 'NO'
+        except Exception as e:
+            print(f"[Gemini error] {e}")
+            return 'NO'
+
+    def _parse_yes_no(self, text: str) -> str:
+        if not text:
+            return 'NO'
+        t = text.strip().lower()
+        # keep only 'yes' or 'no' if present; prefer first occurrence
+        if re.search(r'\byes\b', t):
+            return 'YES'
+        if re.search(r'\bno\b', t):
+            return 'NO'
+        # fallbacks for variants like 'y', 'n'
+        if re.match(r'^\s*y\s*$', t):
+            return 'YES'
+        if re.match(r'^\s*n\s*$', t):
+            return 'NO'
+        return 'NO'
+    
+    
+# ...existing code...
 
 if __name__ == '__main__':
+  
+    load_dotenv()
     bot = MultiPairBot(CONFIG)
     bot.run()
