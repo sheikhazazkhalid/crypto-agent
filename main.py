@@ -946,7 +946,6 @@ class MultiPairBot:
 # ...existing code...
 
 if __name__ == '__main__':
-  
     load_dotenv()
     bot = MultiPairBot(CONFIG)
     bot.run()
