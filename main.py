@@ -53,10 +53,10 @@ CONFIG = {
     'volume_confirm_multiplier': 1.2,     # require volume >= multiplier * vol_avg
 
     # Risk Management
-    'trade_allocation': 0.10,         # % of available USDT balance per trade
+    'trade_allocation': 100,         # USDT per trade
     'min_trade_usdt': 10.0,           # Minimum USDT per trade
     'stop_loss_pct': 0.01,            # 1% stop loss
-    'take_profit_pct': 0.015,         # 1.5% take profit
+    'take_profit_pct': 0.01,         # 1% take profit
 
     # Indicator params
     'ema_fast_span': 12,
@@ -88,7 +88,7 @@ CONFIG = {
     'exchange_for_trading': 'binance', # 'binance' for global trading (your account), 'binanceus' for US
 
     # === NEW: Gemini decision gate ===
-    'enable_gemini_filter': True,          # if True, require Gemini to answer "Yes" to buy
+    'enable_gemini_filter': False,          # if True, require Gemini to answer "Yes" to buy
     'gemini_api_key': '',                   # set your Gemini API key here
     'gemini_model': 'gemini-2.5-flash-lite',     # model name
     'gemini_timeout': 10,                   # seconds
@@ -359,7 +359,7 @@ class MultiPairBot:
         latest = df.iloc[-1]
         balance = self.get_balance()
         current_price = float(latest['close'])
-        trade_amount_usdt = max(balance['USDT'] * c['trade_allocation'], c['min_trade_usdt'])
+        trade_amount_usdt = max(c['trade_allocation'], c['min_trade_usdt'])
         trade_amount = trade_amount_usdt / current_price
         pos = self.positions.get(symbol)
 
