@@ -28,8 +28,9 @@ def wilder_rsi(series, period):
 def compute_local_indicators(df, cfg):
     df = df.copy().reset_index(drop=True)
     # EMAs
-    ema_f = ewma(df['close'], cfg['ema_fast_span'])
-    ema_s = ewma(df['close'], cfg['ema_slow_span'])
+    ema_20 = ewma(df['close'], 20)
+    ema_f = ewma(df['close'], cfg.get('ema_fast_span', 12))
+    ema_s = ewma(df['close'], cfg.get('ema_slow_span', 26))
     ema_200 = ewma(df['close'], cfg.get('ema_200_span', 200))
     # MACD / Signal
     macd = ema_f - ema_s
@@ -39,6 +40,7 @@ def compute_local_indicators(df, cfg):
     return pd.DataFrame({
         'time': df['time'],
         'close': df['close'],
+        'EMA_20': ema_20,
         'EMA_fast': ema_f,
         'EMA_slow': ema_s,
         'EMA_200': ema_200,
@@ -63,7 +65,7 @@ def compare_symbol(bot, cfg, symbol, rows=10):
         t = df.at[i, 'time']
         close = df.at[i, 'close']
         print(f"\nROW {i} time={t} close={close}")
-        for col in ('EMA_fast','EMA_slow','EMA_200','MACD','Signal','RSI'):
+        for col in ('EMA_20','EMA_fast','EMA_slow','EMA_200','MACD','Signal','RSI'):
             a = df_bot.at[i, col] if col in df_bot.columns else np.nan
             b = df_local.at[i, col]
             try:
@@ -84,6 +86,7 @@ def compare_symbol(bot, cfg, symbol, rows=10):
     if len(df_bot) > 0 and len(df_local) > 0:
         # use positional indexing (.iloc) to get the last row reliably
         try:
+            diff(df_bot.iloc[last]['EMA_20'],    df_local.iloc[last]['EMA_20'],    'EMA_20')
             diff(df_bot.iloc[last]['EMA_fast'],  df_local.iloc[last]['EMA_fast'],  'EMA_fast')
             diff(df_bot.iloc[last]['EMA_slow'],  df_local.iloc[last]['EMA_slow'],  'EMA_slow')
             diff(df_bot.iloc[last]['EMA_200'],   df_local.iloc[last]['EMA_200'],   'EMA_200')

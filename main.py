@@ -234,10 +234,12 @@ class MultiPairBot:
 
         # EMAs (include 200 EMA used as trend filter)
         if c.get('enable_ema', True):
+            df['EMA_20'] = safe_ewm(df['close'], 20)
             df['EMA_fast'] = safe_ewm(df['close'], c['ema_fast_span'])
             df['EMA_slow'] = safe_ewm(df['close'], c['ema_slow_span'])
             df['EMA_200'] = safe_ewm(df['close'], c.get('ema_200_span', 200))
         else:
+            df['EMA_20'] = np.nan
             df['EMA_fast'] = np.nan
             df['EMA_slow'] = np.nan
             df['EMA_200'] = np.nan
@@ -372,7 +374,7 @@ class MultiPairBot:
         print(f"\n[{symbol}] {ts_pk()}")
         print(
             f"Price: {current_price:.4f} | RSI: {fmt(latest.get('RSI'))} | MACD: {fmt(latest.get('MACD'),6)} | "
-            f"Signal: {fmt(latest.get('Signal'),6)} | EMA200: {fmt(latest.get('EMA_200'))} | "
+            f"Signal: {fmt(latest.get('Signal'),6)} | EMA20: {fmt(latest.get('EMA_20'))} | EMA200: {fmt(latest.get('EMA_200'))} | "
             f"Vol: {fmt(latest.get('volume'))} | VAvg: {fmt(latest.get('vol_avg'))}"
         )
 
@@ -436,15 +438,16 @@ class MultiPairBot:
                     # --- NEW: Higher-timeframe EMA200 trend filter (optional) ---
                     use_htf = bool(c.get('use_htf_trend', False) and c.get('trend_timeframe'))
                     if use_htf:
-                        ema200_val, ema200_time = self.get_htf_ema200(symbol)
-                        ema_label = f"EMA200[{c.get('trend_timeframe')}]"
+                        ema20_val, ema200_val, ema_time = self.get_htf_ema200(symbol)
+                        ema_label = f"EMA20>EMA200[{c.get('trend_timeframe')}]"
                     else:
+                        ema20_val = latest.get('EMA_20', np.nan)
                         ema200_val = latest.get('EMA_200', np.nan)
-                        ema_label = "EMA200[current tf]"
+                        ema_label = "EMA20>EMA200[current tf]"
                     # --- END NEW ---
 
-                    # 3) Confirm trend: price above EMA200 (HTF or current tf)
-                    if not np.isnan(ema200_val) and current_price > float(ema200_val):
+                    # 3) Confirm trend: EMA20 above EMA200 (HTF or current tf)
+                    if not np.isnan(ema20_val) and not np.isnan(ema200_val) and float(ema20_val) > float(ema200_val):
                         # Optional volume confirmation
                         if c.get('enable_volume_confirmation', False):
                             try:
@@ -508,7 +511,7 @@ class MultiPairBot:
                         self.rsi_drops[symbol] = None
                     else:
                         print(f"⛔ {symbol}: MACD crossed at {macd_cross_time} after RSI drop but {ema_label} filter failed "
-                              f"({current_price:.4f} <= {ema200_val if not np.isnan(ema200_val) else 'n/a'}) — clearing watcher")
+                              f"({fmt(ema20_val)} <= {fmt(ema200_val)}) — clearing watcher")
                         self.rsi_drops[symbol] = None
                 # else: keep waiting
 
@@ -663,19 +666,20 @@ class MultiPairBot:
             df_htf['time'] = pd.to_datetime(df_htf['time'], unit='ms')
             df_htf.set_index('time', inplace=True)
 
-            # EMA200 on the higher timeframe
-            ema200_htf = df_htf['close'].ewm(span=200, adjust=False).mean()
-            df_htf['EMA_200'] = ema200_htf
+            # EMAs on the higher timeframe
+            df_htf['EMA_20'] = df_htf['close'].ewm(span=20, adjust=False).mean()
+            df_htf['EMA_200'] = df_htf['close'].ewm(span=200, adjust=False).mean()
 
-            # latest EMA200 value and corresponding time
-            latest_ema200 = df_htf.iloc[-1]
-            ema200_val = latest_ema200['EMA_200']
-            ema200_time = latest_ema200.name
+            # latest EMA values and corresponding time
+            latest_bar = df_htf.iloc[-1]
+            ema20_val = latest_bar['EMA_20']
+            ema200_val = latest_bar['EMA_200']
+            ema_time = latest_bar.name
 
-            return ema200_val, ema200_time
+            return ema20_val, ema200_val, ema_time
         except Exception as e:
-            print(f"[HTF EMA200 fetch error] {symbol} ({timeframe}): {e}")
-            return np.nan, None
+            print(f"[HTF EMA fetch error] {symbol} ({timeframe}): {e}")
+            return np.nan, np.nan, None
 
     # === NEW: Market analysis (5m/15m/1h/4h) ===
     def analyze_market(self, symbol: str, df_base: pd.DataFrame = None) -> dict:
