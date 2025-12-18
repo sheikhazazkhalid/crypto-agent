@@ -56,7 +56,7 @@ CONFIG = {
     'trade_allocation': 100,         # USDT per trade
     'min_trade_usdt': 10.0,           # Minimum USDT per trade
     'stop_loss_pct': 0.01,            # 1% stop loss
-    'take_profit_pct': 0.01,         # 1% take profit
+    'take_profit_pct': 0.02,         # 2% take profit
 
     # Indicator params
     'ema_fast_span': 12,
@@ -65,6 +65,7 @@ CONFIG = {
     'rsi_period': 14,
     'rsi_buy_threshold': 25,          # RSI drop threshold (watch)
     'ema_200_span': 200,              # 200 EMA filter
+    'ema_20_span': 20,                # 20 EMA for trend check
     'cross_lookback': 8,              # how many past bars to scan for MACD cross after RSI drop
 
     # volume
@@ -74,7 +75,6 @@ CONFIG = {
     'use_htf_trend': True,        # True = use a separate timeframe for the EMA200 trend check
     'trend_timeframe': '15m',     # e.g., '15m', '1h', '4h'
     'trend_limit': 300,           # candles to fetch for trend timeframe
-    'trend_ema_span': 200,        # EMA span to use on the trend timeframe (usually 200)
     # --- END NEW ---
 
    
@@ -84,7 +84,7 @@ CONFIG = {
     # order type
     'order_type': 'market',  # 'market' or 'limit'
     'limit_price_buffer_pct': 0.001,  # 0.1% buffer for limit orders (above for buy, below for sell)
-    'exchange_for_data': 'mexc',  
+    'exchange_for_data': 'mexc',    # 'binance' for global data, 'binanceus' for US
     'exchange_for_trading': 'binance', # 'binance' for global trading (your account), 'binanceus' for US
 
     # === NEW: Gemini decision gate ===
@@ -234,7 +234,7 @@ class MultiPairBot:
 
         # EMAs (include 200 EMA used as trend filter)
         if c.get('enable_ema', True):
-            df['EMA_20'] = safe_ewm(df['close'], 20)
+            df['EMA_20'] = safe_ewm(df['close'], c.get('ema_20_span', 20))
             df['EMA_fast'] = safe_ewm(df['close'], c['ema_fast_span'])
             df['EMA_slow'] = safe_ewm(df['close'], c['ema_slow_span'])
             df['EMA_200'] = safe_ewm(df['close'], c.get('ema_200_span', 200))
