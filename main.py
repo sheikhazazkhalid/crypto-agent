@@ -678,36 +678,26 @@ class MultiPairBot:
             return np.nan, None
 
     # === NEW: Market analysis (5m/15m/1h/4h) ===
-    def analyze_market(self, symbol: str, df_5m: pd.DataFrame = None) -> dict:
+    def analyze_market(self, symbol: str, df_base: pd.DataFrame = None) -> dict:
         """
-        Returns a dict like:
-        {
-          'symbol': 'ADA/USDT',
-          'current_price': 0.6559,
-          'general_bias_1h': 'BULLISH',
-          'recent_support': 0.6466,
-          'recent_resistance': 0.6596,
-          'volume_ratio': 1.8,
-          'volume_bias': 'HIGH',
-          'volatility_ratio': 1.4,
-          'volatility_bias': 'NORMAL',
-          'trend_1h': 'BULLISH',
-          'trend_4h': 'BULLISH'
-        }
+        Returns a dict with market analysis using configurable timeframes from CONFIG.
         """
         c = self.cfg
+        base_tf = c.get('timeframe', '5m')
+        trend_tf = c.get('trend_timeframe', '15m')
+        # For bias, volume, volatility, use base_tf; for pivots, use base_tf and trend_tf; for trend, use trend_tf and next higher (if available)
         out = {
             'symbol': symbol,
             'current_price': None,
-            'general_bias_1h': None,
+            'general_bias': None,
             'recent_support': None,
             'recent_resistance': None,
             'volume_ratio': None,
             'volume_bias': None,
             'volatility_ratio': None,
             'volatility_bias': None,
-            'trend_1h': None,
-            'trend_4h': None,
+            'trend_main': None,
+            'trend_higher': None,
         }
 
         # Current price from real-time ticker
@@ -717,35 +707,35 @@ class MultiPairBot:
         except Exception:
             pass
 
-        # Ensure 5m df
+        # Ensure base timeframe df
         try:
-            if df_5m is None:
-                ohlcv = self.data_client.fetch_ohlcv(symbol, '5m', limit=max(100, c.get('limit', 300)))
-                df_5m = pd.DataFrame(ohlcv, columns=['time','open','high','low','close','volume'])
-                df_5m['time'] = pd.to_datetime(df_5m['time'], unit='ms')
-                df_5m.set_index('time', inplace=True)
+            if df_base is None:
+                ohlcv = self.data_client.fetch_ohlcv(symbol, base_tf, limit=max(100, c.get('limit', 300)))
+                df_base = pd.DataFrame(ohlcv, columns=['time','open','high','low','close','volume'])
+                df_base['time'] = pd.to_datetime(df_base['time'], unit='ms')
+                df_base.set_index('time', inplace=True)
         except Exception:
-            df_5m = None
+            df_base = None
 
-        # General bias over last 12 x 5m candles (≈1h): close(now) vs open(12 bars ago)
+        # General bias over last 12 bars: close(now) vs open(12 bars ago)
         try:
-            if df_5m is not None and len(df_5m) >= 12:
-                close_now = float(df_5m['close'].iloc[-1])
-                open_12_ago = float(df_5m['open'].iloc[-12])
+            if df_base is not None and len(df_base) >= 12:
+                close_now = float(df_base['close'].iloc[-1])
+                open_12_ago = float(df_base['open'].iloc[-12])
                 if close_now > open_12_ago:
-                    out['general_bias_1h'] = 'BULLISH'
+                    out['general_bias'] = 'BULLISH'
                 elif close_now < open_12_ago:
-                    out['general_bias_1h'] = 'BEARISH'
+                    out['general_bias'] = 'BEARISH'
                 else:
-                    out['general_bias_1h'] = 'NEUTRAL'
+                    out['general_bias'] = 'NEUTRAL'
         except Exception:
             pass
 
-        # Volume comparison: current 5m volume vs avg of previous 11 5m
+        # Volume comparison: current volume vs avg of previous 11 bars
         try:
-            if df_5m is not None and len(df_5m) >= 12:
-                cur_vol = float(df_5m['volume'].iloc[-1])
-                prev_avg = float(df_5m['volume'].iloc[-12:-1].mean())
+            if df_base is not None and len(df_base) >= 12:
+                cur_vol = float(df_base['volume'].iloc[-1])
+                prev_avg = float(df_base['volume'].iloc[-12:-1].mean())
                 if prev_avg > 0:
                     vr = cur_vol / prev_avg
                     out['volume_ratio'] = vr
@@ -753,11 +743,11 @@ class MultiPairBot:
         except Exception:
             pass
 
-        # Volatility: current 5m range vs avg range of previous 11 bars
+        # Volatility: current range vs avg range of previous 11 bars
         try:
-            if df_5m is not None and len(df_5m) >= 12:
-                cur_range = float(df_5m['high'].iloc[-1] - df_5m['low'].iloc[-1])
-                prev_ranges = (df_5m['high'] - df_5m['low']).iloc[-12:-1]
+            if df_base is not None and len(df_base) >= 12:
+                cur_range = float(df_base['high'].iloc[-1] - df_base['low'].iloc[-1])
+                prev_ranges = (df_base['high'] - df_base['low']).iloc[-12:-1]
                 avg_prev_range = float(prev_ranges.mean())
                 if avg_prev_range > 0:
                     vlt = cur_range / avg_prev_range
@@ -766,40 +756,46 @@ class MultiPairBot:
         except Exception:
             pass
 
-        # Support/Resistance using recent pivots on 5m and 15m
+        # Support/Resistance using recent pivots on base_tf and trend_tf
         try:
-            sup5, res5, ts5 = self._recent_pivots(df_5m) if df_5m is not None else (None, None, None)
+            sup_base, res_base, ts_base = self._recent_pivots(df_base) if df_base is not None else (None, None, None)
         except Exception:
-            sup5, res5, ts5 = (None, None, None)
+            sup_base, res_base, ts_base = (None, None, None)
         try:
-            ohlcv15 = self.data_client.fetch_ohlcv(symbol, '15m', limit=200)
-            df_15m = pd.DataFrame(ohlcv15, columns=['time','open','high','low','close','volume'])
-            df_15m['time'] = pd.to_datetime(df_15m['time'], unit='ms')
-            df_15m.set_index('time', inplace=True)
-            sup15, res15, ts15 = self._recent_pivots(df_15m)
+            ohlcv_trend = self.data_client.fetch_ohlcv(symbol, trend_tf, limit=200)
+            df_trend = pd.DataFrame(ohlcv_trend, columns=['time','open','high','low','close','volume'])
+            df_trend['time'] = pd.to_datetime(df_trend['time'], unit='ms')
+            df_trend.set_index('time', inplace=True)
+            sup_trend, res_trend, ts_trend = self._recent_pivots(df_trend)
         except Exception:
-            sup15, res15, ts15 = (None, None, None)
+            sup_trend, res_trend, ts_trend = (None, None, None)
 
-        # choose most recent levels among 5m and 15m
-        sup_choice = (sup5, ts5) if ts5 is not None else (None, None)
-        if ts15 is not None and (sup_choice[1] is None or ts15 > sup_choice[1]):
-            sup_choice = (sup15, ts15)
-        res_choice = (res5, ts5) if ts5 is not None else (None, None)
-        if ts15 is not None and (res_choice[1] is None or ts15 > res_choice[1]):
-            res_choice = (res15, ts15)
+        # choose most recent levels among base_tf and trend_tf
+        sup_choice = (sup_base, ts_base) if ts_base is not None else (None, None)
+        if ts_trend is not None and (sup_choice[1] is None or ts_trend > sup_choice[1]):
+            sup_choice = (sup_trend, ts_trend)
+        res_choice = (res_base, ts_base) if ts_base is not None else (None, None)
+        if ts_trend is not None and (res_choice[1] is None or ts_trend > res_choice[1]):
+            res_choice = (res_trend, ts_trend)
 
         out['recent_support'] = float(sup_choice[0]) if sup_choice[0] is not None else None
         out['recent_resistance'] = float(res_choice[0]) if res_choice[0] is not None else None
 
-        # Higher timeframe trends via EMA(200) on 1h and 4h
+        # Higher timeframe trends via EMA(200) on trend_tf and next higher (if available)
         try:
-            out['trend_1h'] = self._ema_trend(symbol, '1h', span=200)
+            out['trend_main'] = self._ema_trend(symbol, trend_tf, span=200)
         except Exception:
             pass
-        try:
-            out['trend_4h'] = self._ema_trend(symbol, '4h', span=200)
-        except Exception:
-            pass
+        # Next higher timeframe: try to guess (e.g., if trend_tf is '1h', use '4h'; if '4h', use '1d')
+        next_higher = None
+        tf_map = {'5m': '15m', '15m': '1h', '1h': '4h', '4h': '1d', '1d': '1w'}
+        if trend_tf in tf_map:
+            next_higher = tf_map[trend_tf]
+        if next_higher:
+            try:
+                out['trend_higher'] = self._ema_trend(symbol, next_higher, span=200)
+            except Exception:
+                pass
 
         return out
 
