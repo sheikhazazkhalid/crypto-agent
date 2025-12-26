@@ -47,10 +47,6 @@ CONFIG = {
     'enable_ema': True,
     'enable_macd': True,
     'enable_rsi': True,
-    'enable_volume_avg': True,
-    # New: entry volume confirmation (optional)
-    'enable_volume_confirmation': False,  # set True to require volume confirmation on entries
-    'volume_confirm_multiplier': 1.2,     # require volume >= multiplier * vol_avg
 
     # Risk Management
     'trade_allocation': 100,         # USDT per trade
@@ -68,9 +64,6 @@ CONFIG = {
     'ema_20_span': 20,                # 20 EMA for trend check
     'cross_lookback': 8,              # how many past bars to scan for MACD cross after RSI drop
 
-    # volume
-    'volume_avg_window': 20,
-
     # --- NEW: higher-timeframe trend filter ---
     'use_htf_trend': False,       # True = use a separate timeframe for the EMA200 trend check
     'trend_timeframe': '15m',     # e.g., '15m', '1h', '4h'
@@ -87,11 +80,6 @@ CONFIG = {
     'exchange_for_data': 'mexc',    # 'binance' for global data, 'binanceus' for US
     'exchange_for_trading': 'binance', # 'binance' for global trading (your account), 'binanceus' for US
 
-    # === NEW: Gemini decision gate ===
-    'enable_gemini_filter': False,          # if True, require Gemini to answer "Yes" to buy
-    'gemini_api_key': '',                   # set your Gemini API key here
-    'gemini_model': 'gemini-2.5-flash-lite',     # model name
-    'gemini_timeout': 10,                   # seconds
 }
 
 
@@ -258,11 +246,6 @@ class MultiPairBot:
         else:
             df['RSI'] = np.nan
 
-        # volume average (kept)
-        if c.get('enable_volume_avg', True):
-            df['vol_avg'] = df['volume'].rolling(window=c['volume_avg_window']).mean()
-        else:
-            df['vol_avg'] = np.nan
 
         # remove support/resistance from previous logic (not used)
         df['Support'] = np.nan
@@ -374,8 +357,7 @@ class MultiPairBot:
         print(f"\n[{symbol}] {ts_pk()}")
         print(
             f"Price: {current_price:.4f} | RSI: {fmt(latest.get('RSI'))} | MACD: {fmt(latest.get('MACD'),6)} | "
-            f"Signal: {fmt(latest.get('Signal'),6)} | EMA20: {fmt(latest.get('EMA_20'))} | EMA200: {fmt(latest.get('EMA_200'))} | "
-            f"Vol: {fmt(latest.get('volume'))} | VAvg: {fmt(latest.get('vol_avg'))}"
+            f"Signal: {fmt(latest.get('Signal'),6)} | EMA20: {fmt(latest.get('EMA_20'))} | EMA200: {fmt(latest.get('EMA_200'))}"
         )
 
         # Manage existing trade (SL/TP)
@@ -448,25 +430,6 @@ class MultiPairBot:
 
                     # 3) Confirm trend: EMA20 above EMA200 (HTF or current tf)
                     if not np.isnan(ema20_val) and not np.isnan(ema200_val) and float(ema20_val) > float(ema200_val):
-                        # Optional volume confirmation
-                        if c.get('enable_volume_confirmation', False):
-                            try:
-                                cur_vol = float(latest.get('volume', np.nan))
-                            except Exception:
-                                cur_vol = np.nan
-                            vavg = latest.get('vol_avg', np.nan)
-                            if np.isnan(vavg):
-                                try:
-                                    vavg = float(df['volume'].rolling(window=c.get('volume_avg_window', 20)).mean().iloc[-1])
-                                except Exception:
-                                    vavg = np.nan
-                            multiplier = float(c.get('volume_confirm_multiplier', 1.0))
-                            vol_ok = (not np.isnan(cur_vol)) and (not np.isnan(vavg)) and (cur_vol >= multiplier * vavg)
-                            if not vol_ok:
-                                print(f"⛔ {symbol}: Volume confirmation failed at cross — vol {cur_vol if not np.isnan(cur_vol) else 'n/a'} < {multiplier}× vavg {vavg if not np.isnan(vavg) else 'n/a'} (skipping buy; clearing watcher)")
-                                # Clear watcher on volume confirmation failure and STOP processing this entry
-                                self.rsi_drops[symbol] = None
-                                return
                         # enforce max open positions limit
                         if not self.can_open_new_trade():
                             print(f"⛔ {symbol}: max open positions reached ({self.get_open_positions_count()}/{c.get('max_open_positions')}) - skipping buy and clearing watcher")
@@ -474,16 +437,6 @@ class MultiPairBot:
                             self.rsi_drops[symbol] = None
                             return
 
-                        # === NEW: Gemini Yes/No gate ===
-                        if c.get('enable_gemini_filter', False):
-                            analysis = self.analyze_market(symbol, df)
-                            decision = self.call_gemini_for_trade_decision(analysis)
-                            if decision != 'YES':
-                                print(f"⛔ {symbol}: Gemini decision = {decision}. Skipping buy and clearing watcher.")
-                                self.send_alerts(f"⛔ {symbol}: Gemini decision = {decision}. Buy skipped.")
-                                self.rsi_drops[symbol] = None
-                                return
-                        # === END NEW ===
                         
                         stop_loss = current_price * (1 - c['stop_loss_pct'])
                         take_profit = current_price * (1 + c['take_profit_pct'])
@@ -681,268 +634,7 @@ class MultiPairBot:
             print(f"[HTF EMA fetch error] {symbol} ({timeframe}): {e}")
             return np.nan, np.nan, None
 
-    # === NEW: Market analysis (5m/15m/1h/4h) ===
-    def analyze_market(self, symbol: str, df_base: pd.DataFrame = None) -> dict:
-        """
-        Returns a dict with market analysis using configurable timeframes from CONFIG.
-        """
-        c = self.cfg
-        base_tf = c.get('timeframe', '5m')
-        trend_tf = c.get('trend_timeframe', '15m')
-        # For bias, volume, volatility, use base_tf; for pivots, use base_tf and trend_tf; for trend, use trend_tf and next higher (if available)
-        out = {
-            'symbol': symbol,
-            'current_price': None,
-            'general_bias': None,
-            'recent_support': None,
-            'recent_resistance': None,
-            'volume_ratio': None,
-            'volume_bias': None,
-            'volatility_ratio': None,
-            'volatility_bias': None,
-            'trend_main': None,
-            'trend_higher': None,
-        }
 
-        # Current price from real-time ticker
-        try:
-            tkr = self.data_client.fetch_ticker(symbol)
-            out['current_price'] = float(tkr.get('last') or tkr.get('close') or tkr.get('ask') or tkr.get('bid'))
-        except Exception:
-            pass
-
-        # Ensure base timeframe df
-        try:
-            if df_base is None:
-                ohlcv = self.data_client.fetch_ohlcv(symbol, base_tf, limit=max(100, c.get('limit', 300)))
-                df_base = pd.DataFrame(ohlcv, columns=['time','open','high','low','close','volume'])
-                df_base['time'] = pd.to_datetime(df_base['time'], unit='ms')
-                df_base.set_index('time', inplace=True)
-        except Exception:
-            df_base = None
-
-        # General bias over last 12 bars: close(now) vs open(12 bars ago)
-        try:
-            if df_base is not None and len(df_base) >= 12:
-                close_now = float(df_base['close'].iloc[-1])
-                open_12_ago = float(df_base['open'].iloc[-12])
-                if close_now > open_12_ago:
-                    out['general_bias'] = 'BULLISH'
-                elif close_now < open_12_ago:
-                    out['general_bias'] = 'BEARISH'
-                else:
-                    out['general_bias'] = 'NEUTRAL'
-        except Exception:
-            pass
-
-        # Volume comparison: current volume vs avg of previous 11 bars
-        try:
-            if df_base is not None and len(df_base) >= 12:
-                cur_vol = float(df_base['volume'].iloc[-1])
-                prev_avg = float(df_base['volume'].iloc[-12:-1].mean())
-                if prev_avg > 0:
-                    vr = cur_vol / prev_avg
-                    out['volume_ratio'] = vr
-                    out['volume_bias'] = 'HIGH' if vr >= 1.2 else ('LOW' if vr <= 0.8 else 'NORMAL')
-        except Exception:
-            pass
-
-        # Volatility: current range vs avg range of previous 11 bars
-        try:
-            if df_base is not None and len(df_base) >= 12:
-                cur_range = float(df_base['high'].iloc[-1] - df_base['low'].iloc[-1])
-                prev_ranges = (df_base['high'] - df_base['low']).iloc[-12:-1]
-                avg_prev_range = float(prev_ranges.mean())
-                if avg_prev_range > 0:
-                    vlt = cur_range / avg_prev_range
-                    out['volatility_ratio'] = vlt
-                    out['volatility_bias'] = 'HIGH' if vlt >= 1.5 else ('LOW' if vlt <= 0.7 else 'NORMAL')
-        except Exception:
-            pass
-
-        # Support/Resistance using recent pivots on base_tf and trend_tf
-        try:
-            sup_base, res_base, ts_base = self._recent_pivots(df_base) if df_base is not None else (None, None, None)
-        except Exception:
-            sup_base, res_base, ts_base = (None, None, None)
-        try:
-            ohlcv_trend = self.data_client.fetch_ohlcv(symbol, trend_tf, limit=200)
-            df_trend = pd.DataFrame(ohlcv_trend, columns=['time','open','high','low','close','volume'])
-            df_trend['time'] = pd.to_datetime(df_trend['time'], unit='ms')
-            df_trend.set_index('time', inplace=True)
-            sup_trend, res_trend, ts_trend = self._recent_pivots(df_trend)
-        except Exception:
-            sup_trend, res_trend, ts_trend = (None, None, None)
-
-        # choose most recent levels among base_tf and trend_tf
-        sup_choice = (sup_base, ts_base) if ts_base is not None else (None, None)
-        if ts_trend is not None and (sup_choice[1] is None or ts_trend > sup_choice[1]):
-            sup_choice = (sup_trend, ts_trend)
-        res_choice = (res_base, ts_base) if ts_base is not None else (None, None)
-        if ts_trend is not None and (res_choice[1] is None or ts_trend > res_choice[1]):
-            res_choice = (res_trend, ts_trend)
-
-        out['recent_support'] = float(sup_choice[0]) if sup_choice[0] is not None else None
-        out['recent_resistance'] = float(res_choice[0]) if res_choice[0] is not None else None
-
-        # Higher timeframe trends via EMA(200) on trend_tf and next higher (if available)
-        try:
-            out['trend_main'] = self._ema_trend(symbol, trend_tf, span=200)
-        except Exception:
-            pass
-        # Next higher timeframe: try to guess (e.g., if trend_tf is '1h', use '4h'; if '4h', use '1d')
-        next_higher = None
-        tf_map = {'5m': '15m', '15m': '1h', '1h': '4h', '4h': '1d', '1d': '1w'}
-        if trend_tf in tf_map:
-            next_higher = tf_map[trend_tf]
-        if next_higher:
-            try:
-                out['trend_higher'] = self._ema_trend(symbol, next_higher, span=200)
-            except Exception:
-                pass
-
-        return out
-
-    def _recent_pivots(self, df: pd.DataFrame, left: int = 2, right: int = 2):
-        """
-        Return (support, resistance, timestamp_of_these_pivots) using most recent pivots.
-        Pivot high: local max over window [i-left, i+right]; pivot low: local min similarly.
-        """
-        if df is None or len(df) < left + right + 3:
-            return (None, None, None)
-
-        highs = df['high'].values
-        lows = df['low'].values
-        idx = df.index
-
-        pivot_high_idx = None
-        pivot_low_idx = None
-
-        # scan from newest backwards to find most recent
-        for i in range(len(df) - right - 1, left - 1, -1):
-            h_win = highs[i - left: i + right + 1]
-            l_win = lows[i - left: i + right + 1]
-            if pivot_high_idx is None and highs[i] == h_win.max():
-                pivot_high_idx = i
-            if pivot_low_idx is None and lows[i] == l_win.min():
-                pivot_low_idx = i
-            if pivot_high_idx is not None and pivot_low_idx is not None:
-                break
-
-        sup = float(lows[pivot_low_idx]) if pivot_low_idx is not None else None
-        res = float(highs[pivot_high_idx]) if pivot_high_idx is not None else None
-
-        # timestamp preference: latest among found pivots
-        ts_candidates = []
-        if pivot_high_idx is not None:
-            ts_candidates.append(idx[pivot_high_idx])
-        if pivot_low_idx is not None:
-            ts_candidates.append(idx[pivot_low_idx])
-        ts = max(ts_candidates) if ts_candidates else None
-
-        return (sup, res, ts)
-
-    def _ema_trend(self, symbol: str, timeframe: str, span: int = 200, limit: int = 300) -> str:
-        ohlcv = self.data_client.fetch_ohlcv(symbol, timeframe, limit=max(limit, span + 10))
-        df = pd.DataFrame(ohlcv, columns=['time','open','high','low','close','volume'])
-        df['time'] = pd.to_datetime(df['time'], unit='ms')
-        df.set_index('time', inplace=True)
-        ema = df['close'].ewm(span=span, adjust=False).mean()
-        if len(df) == 0:
-            return None
-        return 'BULLISH' if float(df['close'].iloc[-1]) > float(ema.iloc[-1]) else 'BEARISH'
-
-    # === NEW: Gemini call and decision ===
-    def call_gemini_for_trade_decision(self, analysis: dict) -> str:
-        """
-        Build a concise prompt from available fields, ask Gemini to respond only 'Yes' or 'No'.
-        Returns 'YES' or 'NO' (uppercase). Defaults to 'NO' on errors/ambiguity.
-        """
-        if not self.cfg.get('enable_gemini_filter', False):
-            return 'YES'  # if filter disabled, do not block
-
-        api_key = (self.cfg.get('gemini_api_key') or os.getenv('GEMINI_API_KEY')).strip()
-        if not api_key:
-            print("⚠️  Gemini filter enabled but gemini_api_key not set — skipping trade (NO).")
-            return 'NO'
-
-        # Build data block with only available fields
-        data_lines = []
-        for k in ['symbol','current_price','general_bias_1h','recent_support','recent_resistance',
-                  'volume_ratio','volume_bias','volatility_ratio','volatility_bias','trend_1h','trend_4h']:
-            v = analysis.get(k, None)
-            if v is not None:
-                data_lines.append(f"'{k}': {repr(v) if not isinstance(v, (float,int)) else v}")
-
-        data_block = "{\n  " + ",\n  ".join(data_lines) + "\n}"
-
-        prompt = (
-            "Analyze the following trading data and decide if a high-probability breakout LONG is advisable.\n\n"
-            f"Data:\n{data_block}\n\n"
-            "Respond with only one word: Yes or No."
-        )
-
-        model = self.cfg.get('gemini_model', 'gemini-2.5-flash-lite')
-        timeout = int(self.cfg.get('gemini_timeout', 10))
-
-        try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={urllib.parse.quote(api_key)}"
-            body = {
-                "contents": [
-                    {"parts": [{"text": prompt}]}
-                ]
-            }
-            data = json.dumps(body).encode()
-            headers = {
-                "Content-Type": "application/json",
-                "User-Agent": "crypto-agent/1.0"
-            }
-            req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                raw = resp.read().decode()
-            parsed = json.loads(raw)
-
-            # Try to extract the first text response
-            text = ""
-            try:
-                candidates = parsed.get('candidates', [])
-                if candidates:
-                    parts = candidates[0].get('content', {}).get('parts', [])
-                    if parts:
-                        text = parts[0].get('text', '')
-            except Exception:
-                text = ""
-
-            decision = self._parse_yes_no(text)
-            print(f"🤖 Gemini decision for {analysis.get('symbol')}: {decision} | raw='{text.strip()[:80]}'")
-            return decision
-        except urllib.error.HTTPError as e:
-            try:
-                body = e.read().decode(errors='ignore')
-            except Exception:
-                body = '<no body>'
-            print(f"[Gemini HTTPError] code={e.code} reason={e.reason} body={body[:200]}")
-            return 'NO'
-        except Exception as e:
-            print(f"[Gemini error] {e}")
-            return 'NO'
-
-    def _parse_yes_no(self, text: str) -> str:
-        if not text:
-            return 'NO'
-        t = text.strip().lower()
-        # keep only 'yes' or 'no' if present; prefer first occurrence
-        if re.search(r'\byes\b', t):
-            return 'YES'
-        if re.search(r'\bno\b', t):
-            return 'NO'
-        # fallbacks for variants like 'y', 'n'
-        if re.match(r'^\s*y\s*$', t):
-            return 'YES'
-        if re.match(r'^\s*n\s*$', t):
-            return 'NO'
-        return 'NO'
-    
     
 # ...existing code...
 
