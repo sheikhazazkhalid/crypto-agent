@@ -56,7 +56,7 @@ CONFIG = {
     'trade_allocation': 100,         # USDT per trade
     'min_trade_usdt': 10.0,           # Minimum USDT per trade
     'stop_loss_pct': 0.01,            # 1% stop loss
-    'take_profit_pct': 0.02,         # 2% take profit
+    'take_profit_pct': 0.01,         # 1% take profit
 
     # Indicator params
     'ema_fast_span': 12,
@@ -72,7 +72,7 @@ CONFIG = {
     'volume_avg_window': 20,
 
     # --- NEW: higher-timeframe trend filter ---
-    'use_htf_trend': True,        # True = use a separate timeframe for the EMA200 trend check
+    'use_htf_trend': False,       # True = use a separate timeframe for the EMA200 trend check
     'trend_timeframe': '15m',     # e.g., '15m', '1h', '4h'
     'trend_limit': 300,           # candles to fetch for trend timeframe
     # --- END NEW ---
@@ -443,7 +443,7 @@ class MultiPairBot:
                     else:
                         ema20_val = latest.get('EMA_20', np.nan)
                         ema200_val = latest.get('EMA_200', np.nan)
-                        ema_label = "EMA20>EMA200[current tf]"
+                        ema_label = f"EMA20>EMA200[{c.get('timeframe')}]"
                     # --- END NEW ---
 
                     # 3) Confirm trend: EMA20 above EMA200 (HTF or current tf)
