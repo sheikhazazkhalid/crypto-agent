@@ -470,8 +470,34 @@ class MultiPairBot:
 
     def summarize_performance(self):
         df = pd.read_sql('SELECT * FROM trades', self.conn)
+        total_trades = len(df)
         total_profit = df['profit_loss'].sum()
-        print(f"\n📊 Total simulated profit: {total_profit:.4f} USDT | Trades: {len(df)}")
+        
+        # Calculate first and last trade dates
+        first_trade_date = "N/A"
+        last_trade_date = "N/A"
+        if total_trades > 0 and 'timestamp' in df.columns:
+            try:
+                df['timestamp'] = pd.to_datetime(df['timestamp'])
+                first_trade_date = df['timestamp'].min().strftime('%Y-%m-%d %H:%M:%S')
+                last_trade_date = df['timestamp'].max().strftime('%Y-%m-%d %H:%M:%S')
+            except Exception:
+                pass
+        
+        # Calculate success rate (percentage of profitable closed trades)
+        success_rate = 0.0
+        closed_trades = df[df['closed'] == 1]
+        if len(closed_trades) > 0:
+            winning_trades = len(closed_trades[closed_trades['profit_loss'] > 0])
+            success_rate = (winning_trades / len(closed_trades)) * 100
+        
+        print(f"\n📊 Performance Summary:")
+        print(f"   Total Trades: {total_trades} | Closed: {len(closed_trades)}")
+        print(f"   Total Profit: {total_profit:.4f} USDT")
+        print(f"   Win Rate: {success_rate:.1f}%")
+        print(f"   First Trade: {first_trade_date}")
+        print(f"   Last Trade: {last_trade_date}")
+        
         return total_profit
 
     def on_exit(self):
